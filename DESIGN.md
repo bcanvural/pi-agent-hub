@@ -201,6 +201,45 @@ extensions in this stable manage foreign knowledge:
 | session files pruned or missing | tolerate: fall back to `output-N.log` tail, say why |
 | headless parents (`pi -p`) auto-drain children in-process | such runs end with the parent; the hub will mostly meet them as history |
 
+## Implementation notes (pinned against pi 0.84.1 / pi-subagents 0.46.0)
+
+Verified from installed `.d.ts` and a real child session file, so v0 starts
+here rather than in archaeology:
+
+- **Overlay**: `ctx.ui.custom<T>((tui, theme, keybindings, done) => component,
+  { overlay: true, overlayOptions })` — component contract is
+  `render(width): string[]` + optional `handleInput(data)`, `dispose()`,
+  `invalidate()`. The stock inspector mounts with
+  `{ anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 }`
+  and sizes rows from `tui.terminal.rows`.
+- **Registration**: `pi.registerCommand(name, { description, handler(args, ctx) })`,
+  `pi.registerShortcut(keyId, { description, handler(ctx) })`,
+  `pi.events: EventBus` (`on` returns an unsubscribe fn).
+- **Components** (all exported):
+  `UserMessageComponent(text, markdownTheme?, outputPad?, transformers?)`;
+  `AssistantMessageComponent(message?, hideThinkingBlock?, markdownTheme?,
+  hiddenThinkingLabel?, outputPad?, transformers?)`;
+  `ToolExecutionComponent(toolName, toolCallId, args, options | undefined,
+  toolDefinition | undefined, ui: TUI, cwd)` — `setArgsComplete()`, then
+  `updateResult({content, details?, isError})`, `setExpanded(bool)`; never
+  `markExecutionStarted()` on replay (it fabricates `Took 0.0s`).
+  `getMarkdownTheme()` supplies the markdown theme.
+- **Session JSONL** (`version: 3`): header
+  `{type:"session", version, id, cwd, timestamp}`; entries carry `type` —
+  parse `type:"message"` and *skip unknown types* (`model_change`,
+  `thinking_level_change`, `session_info` observed). Message shapes:
+  user `{role, content:[{type:"text",…}], timestamp}`; assistant
+  `{role, content:[thinking|text|toolCall blocks], model, usage, stopReason,…}`
+  with toolCall blocks `{type:"toolCall", id, name, arguments}`; toolResult
+  `{role, toolCallId, toolName, isError, content:[…], details?, timestamp}`.
+  Pair toolCall → toolResult by `toolCallId`.
+- **List-pane pragmatics**: RPC `status` fleet entries carry no runId or
+  sessionFile — so the disk scan drives the list (runId, per-step
+  `sessionFile`, `currentTool`, `lastActivityAt` all live in `status.json`),
+  with RPC supplementing liveness and dir-less tracked jobs (rows without a
+  chat pane). Residue filter: keep runs whose `sessionFile` exists; zombie =
+  `state === "running"` with stale `lastUpdate`.
+
 ## Probe findings (2026-08-12, this machine, pi 0.84.1 + pi-subagents 0.46.0)
 
 - 375 parseable run dirs; real runs' `sessionFile` always present under
