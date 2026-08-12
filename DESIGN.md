@@ -38,26 +38,48 @@ A session file is the full record: real message objects with `toolResult.details
 when it exists at all — is a lossy monitoring feed that drops `details` at the
 writer (verified upstream; see nicobailon/pi-subagents#1019).
 
-### Why RPC-first and not the file protocol
+### Run topology (0.46.0, established by killing things)
 
-The `control/` file inbox (steer requests, acks, capabilities, interrupt/stop —
-schema-only validation, atomic writes, 250 ms poll) is real, but it is consumed
-**only by the detached runner process**, and probing showed runs don't have one
-while their parent pi is alive: attached children are separate pi processes
-*without* the steer env, hosted in-process by the extension, with no `control/`
-dir at all. Some runs never touch disk in the first place — RPC `status`
-reported a tracked job with no run directory anywhere. So:
+- **Every fresh child is hosted by the launching pi process** — a separate pi
+  *child process*, but with no steer env, no `control/` watcher, and no runner.
+  "Detached" in the spawn reply is terminology: SIGHUP/pty-kill of the parent
+  killed the child every time, stranding `status.json` at `running` forever.
+  Some runs never even get a run dir (RPC `status` reported a tracked job with
+  no directory anywhere).
+- **The detached `subagent-runner` process exists only for revived runs.**
+  `resume` of a persisted run spawns it — that is where the `control/` inbox,
+  the steer env, capability files and `runner.*.log` come from (all four real
+  runs with runner artifacts here carry `recovery-descriptor.json`).
+- **A steer against a live attached run parks.** RPC `steer` answered `queued`
+  and wrote the file inbox — which nothing watches until a runner exists. The
+  run completed with the request still sitting there, undelivered. `steer` with
+  recovery (the tool path) can *revive* a run to deliver; the RPC sets
+  `steeringRecovery: false`.
+- 0.47 adds a close-grace mechanism (absent from 0.46 source), so this topology
+  will shift — one more reason everything gates on the `ready` manifest's
+  capabilities rather than assumptions.
 
-- **RPC** reaches everything its extension can reach — attached, detached,
-  in-memory — and routes each through the right channel itself.
-- **Files** reach only detached runners, the minority case, and couple us to
-  dir-layout archaeology instead of a versioned envelope with a capability
-  manifest.
+### What this means for typing
 
-The file protocol therefore demotes to a *fallback*: reading `status.json` for
-run discovery when RPC is absent (extension not installed, or inspecting another
-process's leftovers), and — at most — direct inbox writes for orphaned detached
-runs. The hub is a cockpit; `pi-subagents` stays the driver.
+Typing is real, but its semantics are per run state, and the composer must say
+which one it got:
+
+| run state | channel | delivery |
+|---|---|---|
+| running, attached | RPC `steer` | **parked** — delivers on resume; label it, never pretend it's live |
+| running, revived runner (capability `supported: true`) | file inbox / RPC | **live** — injected between turns, acked in `steer-acks/` |
+| stranded `running` (stale `lastUpdate`, parent gone) | RPC `resume` | revive with the message |
+| complete / failed | RPC `resume` {id, message} | **conversation** — the child comes back, answers, session file grows |
+
+That last row quietly replaces the v2 `switchSession` idea: `resume` with a
+message *is* "type to a finished agent and read its answer", first-class and
+upstream-supported, rendered live in our own chat pane as the session file
+grows. No session swapping, no two-writer risk.
+
+RPC-first stands: it reaches attached, revived, and dir-less runs alike and
+routes each itself. Files demote to run discovery when RPC is absent and inbox
+writes for orphaned runners. The hub is a cockpit; `pi-subagents` stays the
+driver.
 
 ## What the ceiling still is
 
@@ -161,13 +183,12 @@ extensions in this stable manage foreign knowledge:
   when RPC is absent; chat pane tailing the selected child's session file.
   Read-only. Already beats the stock inspector on real runs (which have no
   transcript artifact at all) and shows edit diffs, thinking, full markdown.
-- **v1 — type.** Composer over RPC `steer` (+ `interrupt` / `stop`); delivery
-  lifecycle from the reply's `steering.targets[]` plus completion broadcast
-  events; file-inbox fallback for orphaned detached runs.
-- **v2 — enter/return + polish.** For **completed** runs only: native
-  `switchSession(childFile)` → converse → switch back (two-writers rule: never
-  while a runner owns the file). Scrollback, search, `o` to open the child's cwd,
-  copy session path.
+- **v1 — type.** Composer over RPC `steer` / `resume` / `interrupt` / `stop`,
+  with the per-state delivery semantics above surfaced honestly (live vs parked
+  vs revive); lifecycle from the reply's `steering.targets[]`, ack files, and
+  the completion broadcast events; file-inbox fallback for orphaned runners.
+- **v2 — polish.** Scrollback, search, expand/collapse per tool, `o` to open
+  the child's cwd, copy session path, zombie labelling and cleanup hints.
 
 ## Risks
 
@@ -193,5 +214,17 @@ extensions in this stable manage foreign knowledge:
   steer correctly did nothing until a runner exists.
 - Child session file (`version: 3`) confirmed created immediately and growing
   during the run, nested under the parent session's directory.
-- RPC steer delivery into the child's conversation: _pending below._
-- Parent-quit handoff to a detached runner (file-steerable): _pending below._
+- RPC steer against a live attached run: accepted (`queued`, request id
+  returned) but **parked** — the run completed with the request file still
+  unconsumed in `control/steer-requests/`; nothing delivers it until a runner
+  exists. Delivery-state honesty in the composer is a hard requirement.
+- Parent death (SIGHUP/pty kill, and `timeout`-killed headless parent):
+  children die, no runner spawns, `status.json` strands at `running` — zombie
+  detection via `lastUpdate` staleness is required. Graceful-quit handoff was
+  not probed (0.46 has no close-grace; 0.47 adds it).
+- RPC `spawn` works from a foreign extension (workflowScript form only:
+  `return runs.run('main', { agent, task })`); direct params are rejected with
+  a helpful error.
+- The four real runs with runner artifacts all carry
+  `recovery-descriptor.json` → detached runners come from resume/revival, not
+  from launch.
