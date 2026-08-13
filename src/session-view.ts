@@ -268,7 +268,18 @@ function textOfBlocks(content: unknown): string {
 export function hasToolCalls(record: object): boolean {
 	const content = (record as SessionRecord).message?.content;
 	if (!Array.isArray(content)) return false;
-	return content.some(block => typeof block === "object" && block !== null && (block as { type?: string }).type === "toolCall");
+	return content.some(block => {
+		if (typeof block !== "object" || block === null) return false;
+		const b = block as { type?: string; text?: unknown };
+		if (b.type === "toolCall") return true;
+		// A machine-report fence renders as a tool box, so it is a tool group
+		// for focusing and expanding purposes.
+		if (b.type === "text" && typeof b.text === "string" && b.text.includes("```")) {
+			MACHINE_REPORT_FENCE.lastIndex = 0;
+			return MACHINE_REPORT_FENCE.test(b.text);
+		}
+		return false;
+	});
 }
 
 const plainTextCache = new WeakMap<object, string>();
@@ -364,6 +375,48 @@ function unresolvedCalls(record: SessionRecord, resultsByCallId: ResultsById): b
 	return false;
 }
 
+/** The machine-report fence tags the subagents extension instructs children to
+ * end with (`acceptance.ts`: "Finish with a fenced JSON block tagged
+ * `acceptance-report`…") and then parses for its pass/fail verdict. It is
+ * structured output for a machine, printed as prose — a wall of dim JSON in
+ * the middle of a conversation. */
+const MACHINE_REPORT_FENCE = /```[ \t]*(acceptance(?:[-_]report)?|acceptancereport)[ \t]*\r?\n([\s\S]*?)\r?\n?```/gi;
+
+interface MachineReport {
+	tag: string;
+	body: string;
+}
+
+/** Split machine-report fences out of an assistant message, returning a copy
+ * with the fences removed and the reports to render separately. The original
+ * message is never mutated — it is the session record itself. */
+function extractMachineReports(message: NonNullable<SessionRecord["message"]>): { prose: NonNullable<SessionRecord["message"]>; reports: MachineReport[] } {
+	if (!Array.isArray(message.content)) return { prose: message, reports: [] };
+	const reports: MachineReport[] = [];
+	let changed = false;
+	const content: unknown[] = [];
+	for (const block of message.content) {
+		const text = typeof block === "object" && block !== null && (block as { type?: string }).type === "text" ? (block as { text?: unknown }).text : undefined;
+		if (typeof text !== "string" || !text.includes("```")) {
+			content.push(block);
+			continue;
+		}
+		MACHINE_REPORT_FENCE.lastIndex = 0;
+		const stripped = text.replace(MACHINE_REPORT_FENCE, (_whole, tag: string, body: string) => {
+			reports.push({ tag: tag.toLowerCase(), body });
+			return "";
+		});
+		if (stripped === text) {
+			content.push(block);
+			continue;
+		}
+		changed = true;
+		if (stripped.trim()) content.push({ ...(block as object), text: stripped.replace(/\n{3,}/g, "\n\n").trimEnd() });
+	}
+	if (!changed) return { prose: message, reports: [] };
+	return { prose: { ...message, content }, reports };
+}
+
 function renderRecord(
 	record: SessionRecord,
 	resultsByCallId: ResultsById,
@@ -386,7 +439,28 @@ function renderRecord(
 	// Guard before constructing, not after: the component reads `content`
 	// eagerly and throws on a shape it does not expect.
 	if (!Array.isArray(message.content)) return lines;
-	lines.push(...new AssistantMessageComponent(message as never, false, markdownTheme).render(width));
+	const { prose, reports } = extractMachineReports(message);
+	lines.push(...new AssistantMessageComponent(prose as never, false, markdownTheme).render(width));
+	for (const report of reports) {
+		// A real tool component, so the report wears the same box every other
+		// piece of machine output wears — and inherits whatever treatment the
+		// running pi gives renderer-less tools, exactly like the main window
+		// would if this were a tool. Same replay rules as real calls: args
+		// complete, never markExecutionStarted.
+		const component = new ToolExecutionComponent(
+			report.tag,
+			`report-${lines.length}`,
+			{},
+			undefined,
+			undefined,
+			options.tui,
+			options.cwd,
+		);
+		component.setArgsComplete();
+		component.updateResult({ content: [{ type: "text", text: report.body }], isError: false } as never);
+		component.setExpanded(expanded);
+		lines.push(...capToolLines(component.render(width), expanded, width, options.dim));
+	}
 
 	for (const block of message.content) {
 		if (typeof block !== "object" || block === null) continue;
