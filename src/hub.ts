@@ -946,9 +946,10 @@ export class AgentHubComponent {
 		// The panel draws its own frame — the overlay paints no border of its
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
-		// Title, aggregate stats, body, the action row, bottom border, and the
-		// hint bar below the frame (omp keeps its key hints outside the box).
-		const bodyHeight = height - 5;
+		// Title, aggregate stats, a breathing row under them, body, the action
+		// row, bottom border, and the hint bar below the frame (omp keeps its
+		// key hints outside the box).
+		const bodyHeight = height - 6;
 		this.lastChatHeight = Math.max(1, bodyHeight - 2);
 		const listWidth = Math.min(48, Math.max(26, Math.floor(innerWidth * 0.32)));
 		const chatWidth = Math.max(20, innerWidth - listWidth - 3);
@@ -994,6 +995,7 @@ export class AgentHubComponent {
 
 		const lines: string[] = [frameRow(truncateToWidth(title, width - 4), "╭─", "╮")];
 		lines.push(framed(truncateToWidth(stats, innerWidth)));
+		lines.push(framed(""));
 		const listLines = this.renderList(listWidth, bodyHeight, now);
 		const chatLines = this.renderChat(chatWidth, bodyHeight);
 		const separator = this.theme.fg("borderMuted", "│");
