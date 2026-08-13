@@ -712,17 +712,20 @@ export class AgentHubComponent {
 			this.done(undefined);
 			return;
 		}
+		// Reading owns the unshifted keys: j/k/u/d scroll the conversation,
+		// the constant activity; shift means "act on the roster instead" —
+		// J/K change the selection, as do the arrows.
 		const index = this.rows.findIndex(row => rowKey(row) === this.selectedKey);
-		if (data === "\x1b[A" || data === "k") {
+		if (data === "\x1b[A" || data === "K") {
 			if (index > 0) this.select(rowKey(this.rows[index - 1]!));
 			return;
 		}
-		if (data === "\x1b[B" || data === "j") {
+		if (data === "\x1b[B" || data === "J") {
 			if (index >= 0 && index < this.rows.length - 1) this.select(rowKey(this.rows[index + 1]!));
 			return;
 		}
-		if (data === "K") return this.scrollChat(1);
-		if (data === "J") return this.scrollChat(-1);
+		if (data === "k") return this.scrollChat(1);
+		if (data === "j") return this.scrollChat(-1);
 		// Half-page vim motions on plain u/d: pi-tui's editor owns ctrl+u
 		// ("delete to line start") and ctrl+d at a layer above overlays, so the
 		// ctrl forms never arrive — kept below as aliases for terminals where
@@ -1056,7 +1059,7 @@ export class AgentHubComponent {
 		if (this.mode === "compose") return "enter send · esc cancel";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
-		return "↑/↓ select · J/K·u/d scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
+		return "J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest
