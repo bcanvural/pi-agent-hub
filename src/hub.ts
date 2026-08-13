@@ -12,7 +12,7 @@ import { findAck, readCapability, runnerReachable, steerInboxClosed, writeContro
 import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts";
 import { asyncRunsRoot, isStale, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
-import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail, type ChatGroupSpan } from "./session-view.ts";
+import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail } from "./session-view.ts";
 
 const LIST_REFRESH_MS = 2000;
 const TAIL_POLL_MS = 500;
@@ -28,13 +28,11 @@ interface ChatMemo {
 	width: number;
 	height: number;
 	expandedTools: boolean;
-	overrideGen: number;
 	scroll: number;
 	liveStamp: string;
 	lines: string[];
 	linesKnown: number;
 	atOldest: boolean;
-	groups: ChatGroupSpan[];
 }
 
 interface Notice {
@@ -157,18 +155,6 @@ function capText(text: string, max: number): string {
 	return capped;
 }
 
-function firstToolName(record: object): string | undefined {
-	const content = (record as { message?: { content?: unknown } }).message?.content;
-	if (!Array.isArray(content)) return undefined;
-	for (const block of content) {
-		if (typeof block === "object" && block !== null && (block as { type?: string }).type === "toolCall") {
-			const name = (block as { name?: unknown }).name;
-			if (typeof name === "string") return name;
-		}
-	}
-	return undefined;
-}
-
 export class AgentHubComponent {
 	private rows: RunRow[] = [];
 	private readonly scanCache: ScanCache = new Map();
@@ -178,11 +164,6 @@ export class AgentHubComponent {
 	private chatScroll = 0;
 	private follow = true;
 	private expandedTools = false;
-	/** Per-record expand decisions layered over the global toggle. Generation
-	 * bumps on every change so the memo can tell the layers apart. */
-	private expandOverrides = new WeakMap<object, boolean>();
-	private overrideGen = 0;
-	private focusedRecord: object | undefined;
 	private tail: SessionTail | undefined;
 	private chatMemo: ChatMemo | undefined;
 	private rpcInfo: FleetSnapshot = { available: false, entries: [] };
@@ -359,7 +340,6 @@ export class AgentHubComponent {
 		this.chatScroll = 0;
 		this.follow = true;
 		this.chatMemo = undefined;
-		this.focusedRecord = undefined;
 		this.searchMatches = [];
 		this.searchCursor = -1;
 		this.liveOutput = undefined;
@@ -751,20 +731,8 @@ export class AgentHubComponent {
 			this.tui.requestRender();
 			return;
 		}
-		// `t` rather than Tab as the primary binding: the host TUI consumes Tab
-		// before an overlay sees it. The Tab codes stay as aliases for terminals
-		// that do forward them.
-		if (data === "t" || data === "\t") return this.stepToolFocus(-1);
-		if (data === "T" || data === "\x1b[Z") return this.stepToolFocus(1);
 		if (data === "x" || data === "X" || data === "\x0f") {
-			if (data !== "X" && this.focusedRecord) {
-				const effective = this.expandOverrides.get(this.focusedRecord) ?? this.expandedTools;
-				this.expandOverrides.set(this.focusedRecord, !effective);
-			} else {
-				this.expandedTools = !this.expandedTools;
-				this.expandOverrides = new WeakMap();
-			}
-			this.overrideGen++;
+			this.expandedTools = !this.expandedTools;
 			this.chatMemo = undefined;
 			this.tui.requestRender();
 			return;
@@ -933,25 +901,6 @@ export class AgentHubComponent {
 		this.tui.requestRender();
 	}
 
-	private stepToolFocus(direction: -1 | 1): void {
-		const groups = (this.chatMemo?.groups ?? []).filter(group => group.hasTools);
-		if (groups.length === 0) {
-			this.focusedRecord = undefined;
-			this.setNotice("no tool group in view — scroll to one first", "info");
-			return;
-		}
-		const order = groups.map(group => group.record);
-		const current = this.focusedRecord ? order.indexOf(this.focusedRecord) : -1;
-		let next: number;
-		if (current === -1) {
-			next = direction === -1 ? order.length - 1 : 0;
-		} else {
-			next = current + direction;
-		}
-		this.focusedRecord = next < 0 || next >= order.length ? undefined : order[next];
-		this.tui.requestRender();
-	}
-
 	private lastChatHeight = 10;
 	/** Pane height before the indicator/live-output reservations — the stable
 	 * unit for page and half-page motions. Using the post-reservation view
@@ -1059,7 +1008,7 @@ export class AgentHubComponent {
 		if (this.mode === "compose") return "enter send · esc cancel";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
-		return "J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
+		return "J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · x expand · s message · i interrupt · D stop · / find · q close";
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest
@@ -1100,10 +1049,6 @@ export class AgentHubComponent {
 		if (notice) {
 			const tone = notice.tone === "error" ? "error" : notice.tone === "success" ? "success" : "dim";
 			return this.theme.fg(tone, notice.text);
-		}
-		if (this.focusedRecord) {
-			const name = sanitizeLine(firstToolName(this.focusedRecord) ?? "tools");
-			return dim(`focused ⟨${name}⟩ · x expand/collapse · t next · T back`);
 		}
 		if (row) {
 			const channel = this.channelFor(row, now);
@@ -1208,7 +1153,6 @@ export class AgentHubComponent {
 			// OSC-8 file links from it, and a real path is unchanged by the strip.
 			cwd: sanitizeLine(this.selectedRow()?.cwd ?? process.cwd()),
 			expandedTools: this.expandedTools,
-			expandedFor: (record: object) => this.expandOverrides.get(record) ?? this.expandedTools,
 			dim: (text: string): string => this.theme.fg("dim", text),
 			viewHeight: this.lastChatHeight,
 			scroll: this.chatScroll,
@@ -1263,7 +1207,6 @@ export class AgentHubComponent {
 				this.chatMemo.width === width &&
 				this.chatMemo.height === viewHeight &&
 				this.chatMemo.expandedTools === this.expandedTools &&
-				this.chatMemo.overrideGen === this.overrideGen &&
 				this.chatMemo.scroll === this.chatScroll &&
 				this.chatMemo.liveStamp === liveStamp &&
 				this.chatMemo.recordCount === this.tail.records.length &&
@@ -1283,19 +1226,12 @@ export class AgentHubComponent {
 					width,
 					height: viewHeight,
 					expandedTools: this.expandedTools,
-					overrideGen: this.overrideGen,
 					scroll: this.chatScroll,
 					liveStamp,
 					lines: built.lines,
 					linesKnown: built.linesKnown,
 					atOldest: built.atOldest,
-					groups: built.groups,
 				};
-				if (this.focusedRecord && !built.groups.some(group => group.record === this.focusedRecord)) {
-					// The focused group scrolled out of the window; a focus the
-					// reader cannot see is a focus x acts on invisibly.
-					this.focusedRecord = undefined;
-				}
 			}
 			body.push(...this.chatMemo!.lines);
 			if (this.chatMemo!.lines.length === 0) {

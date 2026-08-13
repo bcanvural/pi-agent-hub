@@ -49,8 +49,7 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 | `s` / `enter` | message the run — steers it live, or resumes a finished one |
 | `i` | interrupt (graceful, resumable) |
 | `D D` | stop the run (asks once) |
-| `t` / `T` | focus a tool group; `x` then toggles just that one |
-| `x` / `ctrl+o` | expand or collapse tool output (for tools pi renders) |
+| `x` | expand or collapse tool output (for tools pi renders) |
 | `/`, then `n`/`N` | search the conversation and walk the matches |
 | `o` | open the child's working directory |
 | `y` | copy the session file path |
