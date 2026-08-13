@@ -926,7 +926,11 @@ export class AgentHubComponent {
 	render(width: number): string[] {
 		const now = Date.now();
 		const dim = (text: string): string => this.theme.fg("dim", text);
-		const border = (text: string): string => this.theme.fg("borderMuted", text);
+		// The outer frame takes the focused-overlay color — the same key pi's
+		// own tree selector frames itself with — so the panel separates from
+		// whatever busy screen it floats over. Interior furniture (the pane
+		// separator) stays muted: one focused panel, not more lines everywhere.
+		const border = (text: string): string => this.theme.fg("borderAccent", text);
 		const terminalRows = (this.tui as unknown as { terminal?: { rows?: number } }).terminal?.rows ?? 40;
 		// ~78% of the terminal: pi centers the overlay on the component's own
 		// height, and a panel that claims almost everything reads as glued to
@@ -992,7 +996,7 @@ export class AgentHubComponent {
 		lines.push(framed(truncateToWidth(stats, innerWidth)));
 		const listLines = this.renderList(listWidth, bodyHeight, now);
 		const chatLines = this.renderChat(chatWidth, bodyHeight);
-		const separator = border("│");
+		const separator = this.theme.fg("borderMuted", "│");
 		for (let index = 0; index < bodyHeight; index++) {
 			const inner = `${pad(listLines[index] ?? "", listWidth)} ${separator} ${pad(chatLines[index] ?? "", chatWidth)}`;
 			lines.push(framed(inner));
