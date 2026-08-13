@@ -723,8 +723,23 @@ export class AgentHubComponent {
 		}
 		if (data === "K") return this.scrollChat(1);
 		if (data === "J") return this.scrollChat(-1);
-		if (data === "\x1b[5~") return this.scrollChat(this.lastChatHeight);
-		if (data === "\x1b[6~") return this.scrollChat(-this.lastChatHeight);
+		// Half-page vim motions. Ctrl+U is safe here: compose and search handle
+		// their own input before nav dispatch, so clear-line keeps working there.
+		if (data === "\x15") return this.scrollChat(Math.max(1, Math.floor(this.lastPaneHeight / 2)));
+		if (data === "\x04") return this.scrollChat(-Math.max(1, Math.floor(this.lastPaneHeight / 2)));
+		if (data === "\x1b[5~") return this.scrollChat(this.lastPaneHeight);
+		if (data === "\x1b[6~") return this.scrollChat(-this.lastPaneHeight);
+		if (data === "g") {
+			// Jump to the oldest retained record. The walk renders everything
+			// between the tail and the top once (bounded by MAX_RECORDS, warm
+			// afterwards — same cost class as a deep search jump), and render's
+			// clamp then converts "as far as possible" into the exact offset.
+			this.chatScroll = Number.MAX_SAFE_INTEGER;
+			this.follow = false;
+			this.chatMemo = undefined;
+			this.tui.requestRender();
+			return;
+		}
 		if (data === "G" || data === "\x1b[F" || data === "\x1b[4~") {
 			this.follow = true;
 			this.chatScroll = 0;
@@ -933,6 +948,11 @@ export class AgentHubComponent {
 	}
 
 	private lastChatHeight = 10;
+	/** Pane height before the indicator/live-output reservations — the stable
+	 * unit for page and half-page motions. Using the post-reservation view
+	 * height made ctrl+u then ctrl+d drift by a line, because scrolling up
+	 * reserves the indicator row and shrinks the next motion's half. */
+	private lastPaneHeight = 10;
 	private lastChatWidth = 0;
 
 	/** Scroll is only ever adjusted here; the clamp belongs to render, which is
@@ -1034,7 +1054,7 @@ export class AgentHubComponent {
 		if (this.mode === "compose") return "enter send · esc cancel · ctrl+u clear";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
-		return "↑/↓ select · J/K scroll · G follow · t tool · x expand · s message · i interrupt · D stop · / find · q close";
+		return "↑/↓ select · J/K·^U/^D scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest
@@ -1217,6 +1237,7 @@ export class AgentHubComponent {
 		const state = sanitizeLine(stale ? "stale" : row.state);
 		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${row.model ? ` · ${sanitizeLine(row.model)}` : ""} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
 		const paneHeight = Math.max(1, height - 2);
+		this.lastPaneHeight = paneHeight;
 		// One row is reserved for the scroll indicator, and a block for the live
 		// output tail — reserved, not overwritten, so neither costs content.
 		const liveLines = this.follow && !stale && row.state === "running" ? (this.liveOutput?.lines ?? []) : [];
