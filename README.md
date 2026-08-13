@@ -45,7 +45,7 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 | `↑`/`↓` or `k`/`j` | select a run |
 | `J`/`K`, `PgUp`/`PgDn` | scroll the conversation |
 | `G` / `End` | jump to the tail and follow live |
-| `x` / `ctrl+o` | expand or collapse tool output |
+| `x` / `ctrl+o` | expand or collapse tool output (for tools pi renders) |
 | `r` | rescan runs |
 | `q` / `esc` | back to your conversation |
 
@@ -59,6 +59,11 @@ Only the visible window is rendered, so cost tracks the viewport rather than
 the session: a cold pane on a 7 MB transcript is ~40 ms, and every record is
 rendered behind a catch, because an exception raised inside pi's render pass
 takes the whole session down with it.
+
+Tool output is drawn by pi's own renderers, so expand/collapse behaves as it
+does in the main window. A tool with no registered renderer has no collapsed
+form to offer — the pane prints what pi prints, bounded only against a
+pathologically large result.
 
 Steering, resume conversations, and interrupt/stop controls are designed (see
 `DESIGN.md`) and land next.

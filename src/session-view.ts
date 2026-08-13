@@ -20,6 +20,9 @@ const MAX_TAIL_BYTES = 4 * 1024 * 1024;
  * bound is what keeps a long-lived child affordable. */
 const MAX_RECORDS = 400;
 
+/** How much of the consumed tail is remembered to detect a rewrite. */
+const ANCHOR_BYTES = 64;
+
 interface SessionRecord {
 	type?: string;
 	message?: {
@@ -49,15 +52,42 @@ export class SessionTail {
 	private leftover: Buffer = Buffer.alloc(0);
 	private skipFirstLine = false;
 	private started = false;
-	/** Which file the offset belongs to. A session that is rewritten in place
-	 * (pi migrates a resumed session by reopening it "w") keeps its path and
-	 * can come back LARGER, so size alone cannot detect the swap — and reading
-	 * on from a stale offset would splice the new file's tail onto the old
-	 * file's head and present the result as one conversation. */
+	/** Which file the offset belongs to, and what the bytes just before it were.
+	 *
+	 * A session rewritten in place keeps its path, its inode AND its birth
+	 * time, and can come back larger — `SessionManager._rewriteFile()` reopens
+	 * the file "w" to migrate a resumed session, which is exactly that. Neither
+	 * size nor identity can see it, and reading on from a stale offset splices
+	 * the new file's tail onto the old file's head and presents the result as
+	 * one conversation. So the last bytes consumed are remembered and re-read
+	 * before consuming more: if they changed, what came before is not what this
+	 * reader thinks it read. */
 	private identity = "";
+	private anchor: Buffer = Buffer.alloc(0);
 
 	constructor(filePath: string) {
 		this.filePath = filePath;
+	}
+
+	/** Whether the bytes immediately before the offset are still the ones this
+	 * reader consumed. Cheap — one short read per poll. */
+	private anchorHolds(): boolean {
+		if (this.anchor.length === 0 || this.offset < this.anchor.length) return true;
+		let fd: number;
+		try {
+			fd = fs.openSync(this.filePath, "r");
+		} catch {
+			return true;
+		}
+		try {
+			const seen = Buffer.alloc(this.anchor.length);
+			const read = fs.readSync(fd, seen, 0, seen.length, this.offset - this.anchor.length);
+			return read === seen.length && seen.equals(this.anchor);
+		} catch {
+			return true;
+		} finally {
+			fs.closeSync(fd);
+		}
 	}
 
 	/** Consume anything new. True when records were appended or reset. */
@@ -78,6 +108,7 @@ export class SessionTail {
 			this.started = false;
 		}
 		this.identity = identity;
+		if (this.started && !this.anchorHolds()) this.started = false;
 		if (!this.started || stat.size < this.offset) {
 			this.records.length = 0;
 			this.leftover = Buffer.alloc(0);
@@ -85,6 +116,7 @@ export class SessionTail {
 			this.offset = this.truncatedHead ? stat.size - MAX_TAIL_BYTES : 0;
 			// A mid-file start lands mid-line; the first newline is the seam.
 			this.skipFirstLine = this.truncatedHead;
+			this.anchor = Buffer.alloc(0);
 			this.started = true;
 		}
 		if (stat.size === this.offset) return false;
@@ -111,6 +143,7 @@ export class SessionTail {
 			fs.closeSync(fd);
 		}
 		if (chunk.length === 0) return false;
+		this.anchor = Buffer.from(chunk.subarray(Math.max(0, chunk.length - ANCHOR_BYTES)));
 
 		const data = this.leftover.length > 0 ? Buffer.concat([this.leftover, chunk]) : chunk;
 		const lastNewline = data.lastIndexOf(0x0a);
@@ -172,14 +205,19 @@ export interface ChatWindow {
 
 /** Lines one tool call may contribute before the pane summarises it.
  *
- * Pi's own renderers already bound their built-ins, but a tool with no
- * registered renderer falls through to a generic path that ignores
- * `setExpanded` and prints its whole result — around 40% of the calls in real
- * sessions here, and unbounded in size. The cap is what makes expand/collapse
- * mean something for those, and what stops one 200k-line result from being
- * built at all. */
-const TOOL_LINES_COLLAPSED = 14;
-const TOOL_LINES_EXPANDED = 600;
+ * This is a bound on pathology, not a preview mechanism. A tool with no
+ * registered renderer ignores `setExpanded` and prints its whole result, so a
+ * single call can be arbitrarily large; pi's own renderers, meanwhile, already
+ * collapse their built-ins and carry their own truncation notices.
+ *
+ * The budget therefore sits far above what pi produces — measured across a
+ * real 7 MB session, the widest collapsed built-in group was 47 lines (`grep`),
+ * with `bash` at 24 — because capping below that cut a second hole in the
+ * middle of pi's own shaded preview and truncated the call's arguments
+ * mid-token. Anything under the budget is passed through exactly as pi drew
+ * it. */
+const TOOL_LINES_COLLAPSED = 200;
+const TOOL_LINES_EXPANDED = 2000;
 /** Kept from the top of a capped group, so the call itself stays visible. */
 const TOOL_HEAD_LINES = 3;
 
@@ -195,6 +233,7 @@ function textOfBlocks(content: unknown): string {
 interface GroupCacheEntry {
 	width: number;
 	expandedTools: boolean;
+	cwd: string;
 	lines: string[];
 }
 
@@ -213,6 +252,23 @@ function capToolLines(lines: string[], expanded: boolean, dim: (text: string) =>
 		dim(`  … ${hidden} lines hidden${expanded ? "" : " · x to expand"}`),
 		...lines.slice(-tailKeep),
 	];
+}
+
+/** Tool call ids in a record that have no result yet. A record holding one is
+ * still being answered: its lines will change when the result lands, in a
+ * later record that leaves this one untouched. Caching it would freeze the
+ * call as permanently pending — which is every tool call on a live child, the
+ * one thing the pane exists to show. */
+function unresolvedCalls(record: SessionRecord, resultsByCallId: Map<string, unknown>): boolean {
+	const content = record.message?.content;
+	if (!Array.isArray(content)) return false;
+	for (const block of content) {
+		if (typeof block !== "object" || block === null) continue;
+		const call = block as { type?: string; id?: string };
+		if (call.type !== "toolCall") continue;
+		if (typeof call.id !== "string" || !resultsByCallId.has(call.id)) return true;
+	}
+	return false;
 }
 
 function renderRecord(
@@ -291,9 +347,13 @@ export function buildChatWindow(tail: SessionTail, width: number, options: ChatR
 	let index = tail.records.length - 1;
 	for (; index >= 0 && linesKnown < wanted; index--) {
 		const record = tail.records[index]!;
-		const cached = groupCache.get(record);
+		// `cwd` is baked into what the components draw (file links, relativised
+		// paths), so it belongs in the key even though every selection currently
+		// builds fresh records and cannot collide.
+		const pending = unresolvedCalls(record, resultsByCallId);
+		const cached = pending ? undefined : groupCache.get(record);
 		let lines: string[];
-		if (cached && cached.width === width && cached.expandedTools === options.expandedTools) {
+		if (cached && cached.width === width && cached.expandedTools === options.expandedTools && cached.cwd === options.cwd) {
 			lines = cached.lines;
 		} else {
 			try {
@@ -301,7 +361,7 @@ export function buildChatWindow(tail: SessionTail, width: number, options: ChatR
 			} catch (error) {
 				lines = [options.dim(`⚠ unreadable record: ${error instanceof Error ? error.message : String(error)}`)];
 			}
-			groupCache.set(record, { width, expandedTools: options.expandedTools, lines });
+			if (!pending) groupCache.set(record, { width, expandedTools: options.expandedTools, cwd: options.cwd, lines });
 		}
 		groups.push(lines);
 		linesKnown += lines.length;

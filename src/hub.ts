@@ -244,7 +244,12 @@ export class AgentHubComponent {
 		return this.theme.fg("muted", "■");
 	}
 
-	private renderList(width: number, height: number, now: number): string[] {
+	private renderList(width: number, fullHeight: number, now: number): string[] {
+		// Reserve the notice's row up front. Overwriting the last row instead
+		// erased the selection when the cursor was on it — the list lost its
+		// cursor entirely at the moment the notice appeared.
+		const capped = this.rows.length === MAX_ROWS;
+		const height = Math.max(1, capped ? fullHeight - 1 : fullHeight);
 		if (this.rows.length === 0) {
 			return [this.theme.fg("dim", "no runs found"), this.theme.fg("dim", "launch a background agent"), this.theme.fg("dim", "and it appears here")];
 		}
@@ -265,12 +270,11 @@ export class AgentHubComponent {
 			const name = selected ? this.theme.bold(row.agent) : row.agent;
 			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${name} ${this.theme.fg("dim", `${step}· ${detail}${age ? ` · ${age}` : ""}`)}`, width));
 		}
-		// Inside the budget, not appended past it: a line beyond `height` is
-		// cropped by the frame and the notice never reaches the reader.
-		if (this.rows.length === MAX_ROWS) {
-			const notice = this.theme.fg("dim", `showing newest ${MAX_ROWS}`);
-			if (lines.length >= height) lines[height - 1] = notice;
-			else lines.push(notice);
+		// Inside the budget, not appended past it: a line beyond the frame's
+		// height is cropped and the notice never reaches the reader.
+		if (capped) {
+			while (lines.length < height) lines.push("");
+			lines.push(this.theme.fg("dim", `showing newest ${MAX_ROWS} · r to rescan`));
 		}
 		return lines;
 	}
@@ -286,7 +290,11 @@ export class AgentHubComponent {
 		// column away from a row already calling it stale.
 		const state = isStale(row, now) ? "stale" : row.state;
 		const header = `${this.theme.fg("toolTitle", this.theme.bold(row.agent))} ${dim(`· ${state}${row.model ? ` · ${row.model}` : ""} · ${row.runId.slice(0, 8)}`)}`;
-		const viewHeight = Math.max(1, height - 2);
+		// One row is reserved for the indicator when scrolled, rather than the
+		// indicator overwriting content: the reader loses nothing for the
+		// privilege of being told where they are.
+		const paneHeight = Math.max(1, height - 2);
+		const viewHeight = Math.max(1, this.chatScroll > 0 ? paneHeight - 1 : paneHeight);
 		const body: string[] = [];
 
 		if (!this.tail) {
@@ -342,8 +350,9 @@ export class AgentHubComponent {
 		const filled = [...body];
 		while (filled.length < viewHeight) filled.push("");
 		const view = filled.slice(0, viewHeight);
-		if (this.chatScroll > 0) view[viewHeight - 1] = truncateToWidth(dim(`↓ ${this.chatScroll} newer lines · G to follow`), width);
-		return [truncateToWidth(header, width), "", ...view];
+		if (this.chatScroll > 0) view.push(truncateToWidth(dim(`↓ ${this.chatScroll} newer lines · G to follow`), width));
+		while (view.length < paneHeight) view.push("");
+		return [truncateToWidth(header, width), "", ...view.slice(0, paneHeight)];
 	}
 
 	invalidate(): void {
