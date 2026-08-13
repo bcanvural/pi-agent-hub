@@ -38,7 +38,7 @@ names each: the scan is machine-wide, the RPC reports only this session.
 pi install /path/to/pi-agent-hub        # or -l for one project
 ```
 
-`/hub` opens the panel.
+`/hub` — or `alt+a`, the omp reflex — opens the panel.
 
 | key | action |
 |---|---|
