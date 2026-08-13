@@ -1,0 +1,30 @@
+{
+	"name": "pi-agent-hub",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "A hub inside pi for watching background subagents: full-fidelity chat view of any child, live, with the controls to go with it.",
+	"license": "MIT",
+	"keywords": ["pi-package", "pi-extension", "subagents", "fleet", "hub"],
+	"files": ["src", "README.md"],
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.83.0",
+		"@earendil-works/pi-tui": ">=0.83.0"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": { "optional": true },
+		"@earendil-works/pi-tui": { "optional": true }
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.84.1",
+		"@earendil-works/pi-tui": "0.84.1",
+		"@types/node": "^22.19.19",
+		"typescript": "^7.0.2"
+	}
+}
