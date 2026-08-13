@@ -14,6 +14,8 @@ export interface RunRow {
 	stepIndex: number;
 	stepCount: number;
 	agent: string;
+	/** Which pi session launched the run — control is session-scoped upstream. */
+	sessionId?: string;
 	/** Run-level state as recorded ("running" | "complete" | "failed" | …). */
 	state: string;
 	stepStatus: string;
@@ -29,6 +31,8 @@ export interface RunRow {
 	toolCount?: number;
 	sessionFile?: string;
 	sessionFileExists: boolean;
+	/** Run-level output log name (relative to dir), when recorded. */
+	outputFile?: string;
 	dir: string;
 }
 
@@ -95,6 +99,7 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			stepIndex: index,
 			stepCount: steps.length,
 			agent: asString(step.agent) ?? asString(step.label) ?? "agent",
+			sessionId: asString(status.sessionId),
 			state: asString(status.state) ?? "unknown",
 			stepStatus: asString(step.status) ?? "unknown",
 			model: asString(step.model),
@@ -109,6 +114,7 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			toolCount: asNumber(step.toolCount),
 			sessionFile,
 			sessionFileExists: sessionFile !== undefined && fs.existsSync(sessionFile),
+			outputFile: asString(status.outputFile),
 			dir,
 		});
 	}

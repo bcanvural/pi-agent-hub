@@ -198,12 +198,24 @@ export interface ChatRenderOptions {
 	tui: TUI;
 	cwd: string;
 	expandedTools: boolean;
+	/** Per-record override of the global toggle, when a single tool group has
+	 * been expanded or collapsed on its own. */
+	expandedFor?: (record: object) => boolean;
 	/** Dim styler for the pane's own furniture (markers, notices). */
 	dim: (text: string) => string;
 	/** How many lines the pane will actually show. */
 	viewHeight: number;
 	/** Lines up from the newest; 0 is the live tail. */
 	scroll: number;
+}
+
+/** Where one record's lines sit within the returned window. */
+export interface ChatGroupSpan {
+	record: object;
+	hasTools: boolean;
+	/** Window-relative rows, clipped to the window. */
+	start: number;
+	end: number;
 }
 
 export interface ChatWindow {
@@ -214,6 +226,8 @@ export interface ChatWindow {
 	linesKnown: number;
 	/** The walk consumed every retained record: `linesKnown` is the total. */
 	atOldest: boolean;
+	/** Record groups intersecting the window, oldest first. */
+	groups: ChatGroupSpan[];
 }
 
 /** Lines one tool call may contribute before the pane summarises it.
@@ -224,11 +238,10 @@ export interface ChatWindow {
  * collapse their built-ins and carry their own truncation notices.
  *
  * The budget therefore sits far above what pi produces — measured across a
- * real 7 MB session, the widest collapsed built-in group was 47 lines (`grep`),
- * with `bash` at 24 — because capping below that cut a second hole in the
- * middle of pi's own shaded preview and truncated the call's arguments
- * mid-token. Anything under the budget is passed through exactly as pi drew
- * it. */
+ * real 7 MB session, the widest collapsed built-in group was 47 lines (`grep`)
+ * at 90 columns — because capping below that cut a second hole in the middle
+ * of pi's own shaded preview. Anything under budget passes through exactly as
+ * pi drew it. */
 const TOOL_LINES_COLLAPSED = 200;
 const TOOL_LINES_EXPANDED = 2000;
 /** The width the budgets above were measured at. A group's line count is a
@@ -250,9 +263,51 @@ function textOfBlocks(content: unknown): string {
 		.join("\n");
 }
 
+/** Whether an assistant record carries tool calls — the groups the per-tool
+ * expand toggle and the focus stepper act on. */
+export function hasToolCalls(record: object): boolean {
+	const content = (record as SessionRecord).message?.content;
+	if (!Array.isArray(content)) return false;
+	return content.some(block => typeof block === "object" && block !== null && (block as { type?: string }).type === "toolCall");
+}
+
+const plainTextCache = new WeakMap<object, string>();
+
+/** A record's searchable text: prose, thinking, tool names and arguments for
+ * assistant records; result text for tool results. Bounded per part so one
+ * huge result cannot make searching itself expensive. */
+export function recordPlainText(record: object): string {
+	const cached = plainTextCache.get(record);
+	if (cached !== undefined) return cached;
+	const message = (record as SessionRecord).message;
+	const parts: string[] = [];
+	const content = message?.content;
+	if (typeof content === "string") parts.push(content.slice(0, 4000));
+	else if (Array.isArray(content)) {
+		for (const block of content) {
+			if (typeof block !== "object" || block === null) continue;
+			const b = block as { type?: string; text?: unknown; thinking?: unknown; name?: unknown; arguments?: unknown };
+			if (typeof b.text === "string") parts.push(b.text.slice(0, 4000));
+			if (typeof b.thinking === "string") parts.push(b.thinking.slice(0, 4000));
+			if (b.type === "toolCall" && typeof b.name === "string") {
+				let args = "";
+				try {
+					args = JSON.stringify(b.arguments ?? {});
+				} catch {
+					// Unserialisable arguments search as the name alone.
+				}
+				parts.push(`${b.name} ${args.slice(0, 2000)}`);
+			}
+		}
+	}
+	const text = parts.join("\n");
+	plainTextCache.set(record, text);
+	return text;
+}
+
 interface GroupCacheEntry {
 	width: number;
-	expandedTools: boolean;
+	expanded: boolean;
 	cwd: string;
 	lines: string[];
 }
@@ -278,12 +333,26 @@ function capToolLines(lines: string[], expanded: boolean, width: number, dim: (t
 	];
 }
 
+type ResultsById = Map<string, NonNullable<SessionRecord["message"]>>;
+
+function collectResults(records: readonly SessionRecord[]): ResultsById {
+	const resultsByCallId: ResultsById = new Map();
+	for (const record of records) {
+		const message = record.message;
+		if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
+			// First result wins, matching how the session was actually consumed.
+			if (!resultsByCallId.has(message.toolCallId)) resultsByCallId.set(message.toolCallId, message);
+		}
+	}
+	return resultsByCallId;
+}
+
 /** Tool call ids in a record that have no result yet. A record holding one is
  * still being answered: its lines will change when the result lands, in a
  * later record that leaves this one untouched. Caching it would freeze the
  * call as permanently pending — which is every tool call on a live child, the
  * one thing the pane exists to show. */
-function unresolvedCalls(record: SessionRecord, resultsByCallId: Map<string, unknown>): boolean {
+function unresolvedCalls(record: SessionRecord, resultsByCallId: ResultsById): boolean {
 	const content = record.message?.content;
 	if (!Array.isArray(content)) return false;
 	for (const block of content) {
@@ -297,9 +366,10 @@ function unresolvedCalls(record: SessionRecord, resultsByCallId: Map<string, unk
 
 function renderRecord(
 	record: SessionRecord,
-	resultsByCallId: Map<string, NonNullable<SessionRecord["message"]>>,
+	resultsByCallId: ResultsById,
 	width: number,
 	options: ChatRenderOptions,
+	expanded: boolean,
 ): string[] {
 	const message = record.message;
 	if (!message) return [];
@@ -338,9 +408,31 @@ function renderRecord(
 		const result = resultsByCallId.get(callId);
 		// The component filters `content` without checking it is a list.
 		if (result && Array.isArray(result.content)) component.updateResult(result as never);
-		component.setExpanded(options.expandedTools);
-		lines.push(...capToolLines(component.render(width), options.expandedTools, width, options.dim));
+		component.setExpanded(expanded);
+		lines.push(...capToolLines(component.render(width), expanded, width, options.dim));
 	}
+	return lines;
+}
+
+/** One record's rendered lines, cached against everything that shapes them.
+ * Every render is behind a catch: these are foreign components reading a file
+ * another process writes, and an exception here reaches pi's uncaught handler,
+ * which exits the user's session outright. */
+function groupLines(record: SessionRecord, resultsByCallId: ResultsById, width: number, options: ChatRenderOptions): string[] {
+	const expanded = options.expandedFor ? options.expandedFor(record) : options.expandedTools;
+	// `cwd` is baked into what the components draw (file links, relativised
+	// paths), so it belongs in the key even though every selection currently
+	// builds fresh records and cannot collide.
+	const pending = unresolvedCalls(record, resultsByCallId);
+	const cached = pending ? undefined : groupCache.get(record);
+	if (cached && cached.width === width && cached.expanded === expanded && cached.cwd === options.cwd) return cached.lines;
+	let lines: string[];
+	try {
+		lines = renderRecord(record, resultsByCallId, width, options, expanded);
+	} catch (error) {
+		lines = [options.dim(`⚠ unreadable record: ${error instanceof Error ? error.message : String(error)}`)];
+	}
+	if (!pending) groupCache.set(record, { width, expanded, cwd: options.cwd, lines });
 	return lines;
 }
 
@@ -350,59 +442,70 @@ function renderRecord(
  * the cost is the size of the viewport rather than the size of the session.
  * Rendering the whole retained transcript instead made a cold rebuild take
  * over a second on a real 7 MB session — paid on the host's event loop, which
- * is the same one serving the user's own conversation.
- *
- * Every record is rendered behind a catch. These are foreign components
- * reading a file another process writes; an exception here reaches pi's
- * uncaught handler, which exits the user's session outright. */
+ * is the same one serving the user's own conversation. */
 export function buildChatWindow(tail: SessionTail, width: number, options: ChatRenderOptions): ChatWindow {
-	const resultsByCallId = new Map<string, NonNullable<SessionRecord["message"]>>();
-	for (const record of tail.records) {
-		const message = record.message;
-		if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
-			// First result wins, matching how the session was actually consumed.
-			if (!resultsByCallId.has(message.toolCallId)) resultsByCallId.set(message.toolCallId, message);
-		}
-	}
+	const resultsByCallId = collectResults(tail.records);
 
 	const wanted = Math.max(1, options.viewHeight + Math.max(0, options.scroll));
-	const groups: string[][] = [];
+	const walked: Array<{ record: SessionRecord; lines: string[] }> = [];
 	let linesKnown = 0;
 	let index = tail.records.length - 1;
 	for (; index >= 0 && linesKnown < wanted; index--) {
 		const record = tail.records[index]!;
-		// `cwd` is baked into what the components draw (file links, relativised
-		// paths), so it belongs in the key even though every selection currently
-		// builds fresh records and cannot collide.
-		const pending = unresolvedCalls(record, resultsByCallId);
-		const cached = pending ? undefined : groupCache.get(record);
-		let lines: string[];
-		if (cached && cached.width === width && cached.expandedTools === options.expandedTools && cached.cwd === options.cwd) {
-			lines = cached.lines;
-		} else {
-			try {
-				lines = renderRecord(record, resultsByCallId, width, options);
-			} catch (error) {
-				lines = [options.dim(`⚠ unreadable record: ${error instanceof Error ? error.message : String(error)}`)];
-			}
-			if (!pending) groupCache.set(record, { width, expandedTools: options.expandedTools, cwd: options.cwd, lines });
-		}
-		groups.push(lines);
+		const lines = groupLines(record, resultsByCallId, width, options);
+		walked.push({ record, lines });
 		linesKnown += lines.length;
 	}
 	const atOldest = index < 0;
 
 	const all: string[] = [];
-	for (let group = groups.length - 1; group >= 0; group--) all.push(...groups[group]!);
+	const spans: Array<{ record: SessionRecord; start: number; end: number }> = [];
+	for (let group = walked.length - 1; group >= 0; group--) {
+		const { record, lines } = walked[group]!;
+		spans.push({ record, start: all.length, end: all.length + lines.length });
+		all.push(...lines);
+	}
 	if (atOldest) {
 		while (all.length > 0 && !(all.at(-1) ?? "").trim()) all.pop();
-		if (tail.truncatedHead) all.unshift(options.dim("↑ earlier conversation omitted"));
+		if (tail.truncatedHead) {
+			all.unshift(options.dim("↑ earlier conversation omitted"));
+			for (const span of spans) {
+				span.start += 1;
+				span.end += 1;
+			}
+		}
 	}
 
 	const scroll = Math.min(Math.max(0, options.scroll), Math.max(0, all.length - options.viewHeight));
 	const end = all.length - scroll;
-	const window = all.slice(Math.max(0, end - options.viewHeight), end);
+	const windowStart = Math.max(0, end - options.viewHeight);
+	const groups: ChatGroupSpan[] = [];
+	for (const span of spans) {
+		const clampedEnd = Math.min(span.end, all.length);
+		if (clampedEnd <= windowStart || span.start >= end) continue;
+		groups.push({
+			record: span.record,
+			hasTools: hasToolCalls(span.record),
+			start: Math.max(0, span.start - windowStart),
+			end: Math.min(options.viewHeight, clampedEnd - windowStart),
+		});
+	}
+	const window = all.slice(windowStart, end);
 	// Pi's renderer throws on any row wider than the terminal, and these rows
 	// come from components that were not told our width is a panel column.
-	return { lines: window.map(line => truncateToWidth(line, width)), linesKnown: all.length, atOldest };
+	return { lines: window.map(line => truncateToWidth(line, width)), linesKnown: all.length, atOldest, groups };
+}
+
+/** Lines from the live tail up to and including `recordIndex`'s group — the
+ * quantity a search jump turns into a scroll offset. Walks (cached) renders
+ * down to the target, so a deep first jump costs what paging there would;
+ * afterwards the cache answers. Returns undefined for an unknown index. */
+export function bottomOffsetOfRecord(tail: SessionTail, recordIndex: number, width: number, options: ChatRenderOptions): number | undefined {
+	if (recordIndex < 0 || recordIndex >= tail.records.length) return undefined;
+	const resultsByCallId = collectResults(tail.records);
+	let below = 0;
+	for (let index = tail.records.length - 1; index >= recordIndex; index--) {
+		below += groupLines(tail.records[index]!, resultsByCallId, width, options).length;
+	}
+	return below;
 }

@@ -39,16 +39,56 @@ export interface FleetSnapshot {
 	entries: FleetEntry[];
 }
 
+/** A control call's outcome, reduced to what the action row can say. */
+export interface ActionOutcome {
+	ok: boolean;
+	/** Nobody answered at all — the extension is absent or not ready. */
+	unreachable?: boolean;
+	/** First line of the bridge's own wording, or the error message. */
+	text: string;
+	steering?: { requestId?: string; state?: string; deliveryStatus?: string };
+}
+
+export interface RunTarget {
+	id: string;
+	index?: number;
+}
+
+/** Broadcasts the bridge emits when a run finishes or its process ends —
+ * names read from the ready manifest, stable within protocol v1. */
+const RUN_EVENTS = ["subagent:async-complete", "subagent:process-terminal"];
+
 let requestCounter = 0;
 
 export class SubagentsRpc {
 	private readonly offReady: () => void;
 	private manifestSeen = false;
+	/** The session the bridge lives in. Control is scoped to it upstream, so
+	 * ownership decides which runs the RPC will act on at all. */
+	sessionId: string | undefined;
 
 	constructor(private readonly events: RpcEvents) {
-		this.offReady = events.on(READY_EVENT, () => {
+		this.offReady = events.on(READY_EVENT, raw => {
 			this.manifestSeen = true;
+			this.captureSession(raw);
 		});
+	}
+
+	private captureSession(raw: unknown): void {
+		const session = (raw as { session?: { sessionId?: unknown; sessionFile?: unknown } } | undefined)?.session;
+		// Upstream's session identity is the session FILE when one exists, the
+		// UUID only as a fallback (`resolveCurrentSessionId`) — and the file is
+		// what run statuses record. Comparing the UUID against a recorded path
+		// called every run foreign, including this session's own.
+		if (typeof session?.sessionFile === "string" && session.sessionFile) this.sessionId = session.sessionFile;
+		else if (typeof session?.sessionId === "string") this.sessionId = session.sessionId;
+	}
+
+	/** One ping to learn the session id when the ready broadcast predates us. */
+	async identify(): Promise<void> {
+		if (this.sessionId !== undefined) return;
+		const reply = await this.call("ping", undefined, 3000);
+		if (reply?.success) this.captureSession(reply.data);
 	}
 
 	/** Whether the bridge has announced itself this process — a hint, not a
@@ -92,6 +132,41 @@ export class SubagentsRpc {
 			...(typeof fleet.totalActive === "number" ? { totalActive: fleet.totalActive } : {}),
 			entries: Array.isArray(fleet.entries) ? fleet.entries : [],
 		};
+	}
+
+	/** One notification per run-lifecycle broadcast, so the list can refresh
+	 * the moment a run finishes instead of on the next scan tick. */
+	onRunEvents(handler: () => void): () => void {
+		const offs = RUN_EVENTS.map(event => this.events.on(event, handler));
+		return () => {
+			for (const off of offs) off();
+		};
+	}
+
+	private async action(method: string, params: Record<string, unknown>): Promise<ActionOutcome> {
+		const reply = await this.call(method, params, 10_000);
+		if (reply === undefined) return { ok: false, unreachable: true, text: "no answer from the subagents extension" };
+		if (!reply.success) return { ok: false, text: reply.error?.message ?? `subagents rejected the ${method}` };
+		const data = reply.data ?? {};
+		const details = (data.details ?? {}) as { steering?: ActionOutcome["steering"] };
+		const text = String((data as { text?: unknown }).text ?? "").split("\n")[0] ?? "";
+		return { ok: true, text, ...(details.steering ? { steering: details.steering } : {}) };
+	}
+
+	steer(target: RunTarget, message: string, mode: "steer" | "follow_up" | "auto" = "auto"): Promise<ActionOutcome> {
+		return this.action("steer", { ...target, message, mode });
+	}
+
+	resume(target: RunTarget, message: string): Promise<ActionOutcome> {
+		return this.action("resume", { id: target.id, message });
+	}
+
+	interrupt(target: RunTarget): Promise<ActionOutcome> {
+		return this.action("interrupt", { ...target });
+	}
+
+	stop(target: RunTarget): Promise<ActionOutcome> {
+		return this.action("stop", { ...target });
 	}
 
 	dispose(): void {

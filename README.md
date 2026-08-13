@@ -45,7 +45,14 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 | `↑`/`↓` or `k`/`j` | select a run |
 | `J`/`K`, `PgUp`/`PgDn` | scroll the conversation |
 | `G` / `End` | jump to the tail and follow live |
+| `s` / `enter` | message the run — steers it live, or resumes a finished one |
+| `i` | interrupt (graceful, resumable) |
+| `D D` | stop the run (asks once) |
+| `t` / `T` | focus a tool group; `x` then toggles just that one |
 | `x` / `ctrl+o` | expand or collapse tool output (for tools pi renders) |
+| `/`, then `n`/`N` | search the conversation and walk the matches |
+| `o` | open the child's working directory |
+| `y` | copy the session file path |
 | `r` | rescan runs |
 | `q` / `esc` | back to your conversation |
 
@@ -65,5 +72,15 @@ does in the main window. A tool with no registered renderer has no collapsed
 form to offer — the pane prints what pi prints, bounded only against a
 pathologically large result.
 
-Steering, resume conversations, and interrupt/stop controls are designed (see
-`DESIGN.md`) and land next.
+Messaging is honest about delivery, because delivery genuinely differs by run
+state: a live runner-backed child takes a steer between turns; an attached
+child's steer parks until the run is resumed; a finished or stranded run is
+resumed — revived with your message, answering into the same pane. Interrupt
+and stop ride the same channels. Control is session-scoped upstream, so runs
+launched by another pi session are labelled view-only unless a live detached
+runner is willing to take file-inbox requests — the one sanctioned
+cross-process channel.
+
+While a live child sits inside a long tool call, the pane tails the run's
+output log under the transcript — bounded and sanitized — so the wait is
+watchable.

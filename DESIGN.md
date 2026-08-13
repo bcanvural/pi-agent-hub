@@ -176,6 +176,23 @@ extensions in this stable manage foreign knowledge:
 - Session-file parsing couples to **pi core's** format, which is versioned
   (`{type:"session", version}` header) and far stabler than any extension.
 
+## Phases — v0 and v1 and v2 are implemented; two facts learned landing them
+
+- **Control is session-scoped upstream.** Every RPC control method checks the
+  run's recorded `sessionId` (the session *file* path — `resolveCurrentSessionId`
+  prefers `getSessionFile()`) against the live session and answers `not_found`
+  for foreign runs. The hub therefore labels foreign runs view-only up front,
+  and reaches live foreign runners only through their file inbox, which has no
+  session check because being the cross-process channel is its purpose.
+- **Resume creates a revival run.** Resuming spawns a *new* run directory (with
+  the detached runner, capability files and logs) that continues the original
+  child session file — so the original row's conversation grows while a new
+  running row appears. Verified live: resume → capability up in ~1s → steer
+  through the composer → delivered between turns → the child obeyed the
+  mid-run instruction. Ack files are consumed (deleted) by the owning
+  extension, so the hub watches them only on the file-fallback path where no
+  owner is alive.
+
 ## Phases
 
 - **v0 — observe.** List pane from RPC `status` (structured fleet entries:
