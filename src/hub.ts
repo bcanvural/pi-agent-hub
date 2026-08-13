@@ -188,6 +188,11 @@ export class AgentHubComponent {
 	 * happening invited re-sends, and each re-send steered the child again. */
 	private actionBusy = false;
 	private editCarry = "";
+	/** Set when a held sequence overflowed the carry bound: the rest of that
+	 * sequence is still arriving, and dropping the carry alone let the
+	 * remainder land as literal text — half a pasted URL in the message.
+	 * Until the sequence's terminator passes, incoming bytes belong to it. */
+	private editDiscard: "st" | "csi" | undefined;
 	private liveOutput: OutputTail | undefined;
 	private liveOutputFile: string | undefined;
 
@@ -776,11 +781,13 @@ export class AgentHubComponent {
 		if (data === "\x1b" || data === "\x03") {
 			this.mode = "nav";
 			this.editCarry = "";
+			this.editDiscard = undefined;
 			this.tui.requestRender();
 			return;
 		}
 		if (data === "\r" || data === "\n") {
 			this.editCarry = "";
+			this.editDiscard = undefined;
 			if (composing) {
 				const row = this.selectedRow();
 				const text = this.composer.trim();
@@ -801,6 +808,7 @@ export class AgentHubComponent {
 		}
 		if (data === "\x7f" || data === "\x08") {
 			this.editCarry = "";
+			this.editDiscard = undefined;
 			if (composing) this.composer = [...this.composer].slice(0, -1).join("");
 			else this.searchInput = [...this.searchInput].slice(0, -1).join("");
 			this.tui.requestRender();
@@ -808,23 +816,51 @@ export class AgentHubComponent {
 		}
 		if (data === "\x15") {
 			this.editCarry = "";
+			this.editDiscard = undefined;
 			if (composing) this.composer = "";
 			else this.searchInput = "";
 			this.tui.requestRender();
 			return;
 		}
-		let combined = this.editCarry + data;
+		let payload = data;
+		// Finish discarding a sequence whose head already overflowed the carry:
+		// everything up to its terminator is sequence payload, not typing.
+		if (this.editDiscard) {
+			const end = this.editDiscard === "st"
+				? (() => {
+					const bel = payload.indexOf("\x07");
+					const st = payload.indexOf("\x1b\\");
+					if (bel === -1 && st === -1) return -1;
+					if (bel === -1) return st + 2;
+					if (st === -1) return bel + 1;
+					return Math.min(bel + 1, st + 2);
+				})()
+				: (() => {
+					const final = /[@-~]/.exec(payload);
+					return final ? final.index + 1 : -1;
+				})();
+			if (end === -1) return;
+			payload = payload.slice(end);
+			this.editDiscard = undefined;
+			if (!payload) return;
+		}
+		let combined = this.editCarry + payload;
 		this.editCarry = "";
 		// Hold back an escape sequence still being delivered — the paste
 		// markers themselves split across reads — rather than mangle its halves.
 		// Bounded: a stranded string introducer (an OSC cut at a read boundary)
 		// otherwise swallows every keystroke after it, silently and forever.
-		// Past the bound the carry is junk terminal chatter, not typing, and is
-		// dropped whole — sequence payloads are never message text.
+		// Past the bound, switch to discarding the rest of that sequence up to
+		// its terminator — sequence payloads are never message text, and merely
+		// dropping the carry let the remainder print as if it were.
 		const lastEscape = combined.lastIndexOf("\x1b");
 		if (lastEscape !== -1 && incompleteEscape(combined.slice(lastEscape))) {
 			const held = combined.slice(lastEscape);
-			this.editCarry = held.length > EDIT_CARRY_MAX ? "" : held;
+			if (held.length > EDIT_CARRY_MAX) {
+				this.editDiscard = held[1] === "[" || held[1] === "O" ? "csi" : "st";
+			} else {
+				this.editCarry = held;
+			}
 			combined = combined.slice(0, lastEscape);
 		}
 		const text = composerText(combined);
