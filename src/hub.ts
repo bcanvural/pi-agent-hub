@@ -169,6 +169,7 @@ export class AgentHubComponent {
 	}
 
 	private lastChatHeight = 10;
+	private lastChatWidth = 0;
 
 	/** Scroll is only ever adjusted here; the clamp belongs to render, which is
 	 * the one place that knows how many lines exist. Clamping here against a
@@ -284,6 +285,20 @@ export class AgentHubComponent {
 		if (!row) return [this.theme.fg("dim", "nothing selected")];
 		const dim = (text: string): string => this.theme.fg("dim", text);
 		const now = Date.now();
+
+		// A position counted in wrapped lines does not survive a change of wrap
+		// width — line 3876 at one width is a different place at another, so
+		// carrying the number over states something untrue. Returning to the
+		// tail also spares a resize the full walk back down to a deep offset,
+		// which a drag would otherwise pay once per column.
+		if (width !== this.lastChatWidth) {
+			this.lastChatWidth = width;
+			if (this.chatScroll !== 0) {
+				this.chatScroll = 0;
+				this.follow = true;
+				this.chatMemo = undefined;
+			}
+		}
 
 		// The same verdict the list row shows. Interpolating the recorded state
 		// raw claimed "running" for a run whose heartbeat had stopped, one

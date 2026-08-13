@@ -143,7 +143,10 @@ export class SessionTail {
 			fs.closeSync(fd);
 		}
 		if (chunk.length === 0) return false;
-		this.anchor = Buffer.from(chunk.subarray(Math.max(0, chunk.length - ANCHOR_BYTES)));
+		// Carried forward, not taken from this chunk alone: a writer flushing a
+		// partial line delivers a handful of bytes, and anchoring on those would
+		// leave a rewrite only those few bytes to match by chance.
+		this.anchor = Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES);
 
 		const data = this.leftover.length > 0 ? Buffer.concat([this.leftover, chunk]) : chunk;
 		const lastNewline = data.lastIndexOf(0x0a);
@@ -218,6 +221,13 @@ export interface ChatWindow {
  * it. */
 const TOOL_LINES_COLLAPSED = 200;
 const TOOL_LINES_EXPANDED = 2000;
+/** The width the budgets above were measured at. A group's line count is a
+ * function of the pane's width — the same `grep` that draws 47 lines at 90
+ * columns draws 177 at 20 — so a fixed line budget is a tightening cap as the
+ * pane narrows, and would start cutting pi's own previews exactly where they
+ * are already hardest to read. Scaling by width keeps the measured margin
+ * constant at every pane size. */
+const TOOL_BUDGET_REFERENCE_WIDTH = 96;
 /** Kept from the top of a capped group, so the call itself stays visible. */
 const TOOL_HEAD_LINES = 3;
 
@@ -242,8 +252,9 @@ interface GroupCacheEntry {
  * records releases their lines too. */
 const groupCache = new WeakMap<object, GroupCacheEntry>();
 
-function capToolLines(lines: string[], expanded: boolean, dim: (text: string) => string): string[] {
-	const budget = expanded ? TOOL_LINES_EXPANDED : TOOL_LINES_COLLAPSED;
+function capToolLines(lines: string[], expanded: boolean, width: number, dim: (text: string) => string): string[] {
+	const base = expanded ? TOOL_LINES_EXPANDED : TOOL_LINES_COLLAPSED;
+	const budget = Math.max(base, Math.round((base * TOOL_BUDGET_REFERENCE_WIDTH) / Math.max(1, width)));
 	if (lines.length <= budget) return lines;
 	const tailKeep = Math.max(1, budget - TOOL_HEAD_LINES - 1);
 	const hidden = lines.length - TOOL_HEAD_LINES - tailKeep;
@@ -315,7 +326,7 @@ function renderRecord(
 		// The component filters `content` without checking it is a list.
 		if (result && Array.isArray(result.content)) component.updateResult(result as never);
 		component.setExpanded(options.expandedTools);
-		lines.push(...capToolLines(component.render(width), options.expandedTools, options.dim));
+		lines.push(...capToolLines(component.render(width), options.expandedTools, width, options.dim));
 	}
 	return lines;
 }
