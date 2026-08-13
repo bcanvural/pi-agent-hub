@@ -976,7 +976,7 @@ export class AgentHubComponent {
 			return typeof total === "number" && Number.isFinite(total) && total > 0 ? sum + total : sum;
 		}, 0);
 		const statsParts = [
-			running > 0 ? this.theme.fg("warning", `⟳ ${running} running`) : dim("nothing running"),
+			running > 0 ? this.theme.fg("warning", `⟳ ${running} running`) : dim("No agents running"),
 			dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} on this machine`),
 			!this.rpcInfo.available
 				? dim("subagents not answering")
