@@ -20,7 +20,11 @@ const CSI = /\x1b\[[0-9;:?]*[ -/]*[@-~]/g;
 const OTHER_ESCAPE = /\x1b./g;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
 
-function sanitize(line: string): string {
+/** One line of untrusted text made safe for a terminal row: escapes and
+ * control bytes stripped, tabs spaced. Exported because every foreign string
+ * the hub interpolates into a row — agent names, models, bridge reply text —
+ * needs exactly this treatment, not only tool stdout. */
+export function sanitizeLine(line: string): string {
 	return line.replace(OSC, "").replace(CSI, "").replace(OTHER_ESCAPE, "").replace(/\t/g, "  ").replace(CONTROL, "");
 }
 
@@ -54,10 +58,13 @@ export function readOutputTail(filePath: string, maxLines: number, previous?: Ou
 
 	const raw = text.split(/\r\n|\r|\n/);
 	// A mid-file start lands mid-line; and a writer mid-append leaves a partial
-	// final line. Drop both rather than show half of either.
+	// final line. Drop both rather than show half of either. The partial-line
+	// verdict is taken before the head is dropped — deciding it afterwards let
+	// a window holding exactly one newline show its half-written tail.
+	const endsMidLine = !text.endsWith("\n");
 	if (offset > 0) raw.shift();
-	if (!text.endsWith("\n") && raw.length > 1) raw.pop();
-	const lines = raw.map(sanitize).filter(line => line.trim().length > 0).slice(-maxLines);
+	if (endsMidLine && raw.length > 0) raw.pop();
+	const lines = raw.map(sanitizeLine).filter(line => line.trim().length > 0).slice(-maxLines);
 	if (lines.length === 0) return undefined;
 	return { stamp, lines };
 }

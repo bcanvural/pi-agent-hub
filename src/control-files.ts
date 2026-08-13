@@ -23,6 +23,10 @@ export interface SteerAck {
 }
 
 const MAX_STEER_MESSAGE_BYTES = 128 * 1024;
+/** Upstream's queue cap, enforced here on the request directory as well —
+ * the child runtime bounds only its own follow-up queue, and this writer is
+ * the one surface that touches a run another session owns. */
+const MAX_QUEUED_REQUESTS = 20;
 
 function controlDir(runDir: string): string {
 	return path.join(runDir, "control");
@@ -39,14 +43,16 @@ export function readCapability(runDir: string, index: number): SteerCapability |
 }
 
 /** Whether the process that declared the capability is still alive. Signal 0
- * delivers nothing — it only asks the kernel if the pid exists. */
+ * delivers nothing — it only asks the kernel if the pid exists. EPERM means
+ * the pid exists but belongs to someone this user cannot signal: alive for
+ * our purposes, since the runner reads its inbox regardless of who we are. */
 export function runnerReachable(capability: SteerCapability | undefined): boolean {
 	if (!capability?.supported || capability.pid <= 0) return false;
 	try {
 		process.kill(capability.pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 
@@ -60,8 +66,13 @@ function base64url(value: string): string {
 	return Buffer.from(value).toString("base64url");
 }
 
-/** Find the acknowledgment for a request, whoever wrote it. Ack files are
- * named `<base64url(requestId)>-<ts>-<order>-<state>[…].json`. */
+/** Find the LATEST acknowledgment for a request, whoever wrote it.
+ *
+ * One request produces a file per state transition — queued, then delivered
+ * or failed — named `<base64url(requestId)>-<ts13>-<order>-<state>[…].json`,
+ * so the timestamp-then-order suffix sorts chronologically and the last file
+ * is the request's current state. Returning whichever the directory yielded
+ * first announced a failed steer as "queued". */
 export function findAck(runDir: string, index: number, requestId: string): SteerAck | undefined {
 	const dir = path.join(controlDir(runDir), "steer-acks", String(index));
 	let names: string[];
@@ -71,15 +82,15 @@ export function findAck(runDir: string, index: number, requestId: string): Steer
 		return undefined;
 	}
 	const prefix = `${base64url(requestId)}-`;
-	for (const name of names) {
-		if (!name.startsWith(prefix)) continue;
+	const matches = names.filter(name => name.startsWith(prefix)).sort();
+	for (let index = matches.length - 1; index >= 0; index--) {
 		try {
-			const raw = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as Partial<SteerAck>;
+			const raw = JSON.parse(fs.readFileSync(path.join(dir, matches[index]!), "utf8")) as Partial<SteerAck>;
 			if (raw.state === "delivered" || raw.state === "queued" || raw.state === "failed") {
 				return { state: raw.state, ...(typeof raw.message === "string" ? { message: raw.message } : {}), ...(typeof raw.deliveryStatus === "string" ? { deliveryStatus: raw.deliveryStatus } : {}) };
 			}
 		} catch {
-			// Mid-write or malformed; the next poll retries.
+			// Mid-write or malformed; try the transition before it.
 		}
 	}
 	return undefined;
@@ -97,6 +108,14 @@ function writeAtomicJson(filePath: string, value: unknown): void {
 export function writeSteerRequestFile(runDir: string, message: string, targetIndex?: number): string {
 	if (Buffer.byteLength(message, "utf8") > MAX_STEER_MESSAGE_BYTES) {
 		throw new Error("message exceeds the steer transport limit (128 KB)");
+	}
+	const requestsDir = path.join(controlDir(runDir), "steer-requests");
+	try {
+		if (fs.readdirSync(requestsDir).filter(name => name.endsWith(".json")).length >= MAX_QUEUED_REQUESTS) {
+			throw new Error(`the run's steer inbox is full (${MAX_QUEUED_REQUESTS} queued and unread)`);
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	const id = randomUUID();
 	const ts = Date.now();

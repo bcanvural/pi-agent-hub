@@ -9,7 +9,7 @@ import * as path from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { findAck, readCapability, runnerReachable, steerInboxClosed, writeControlRequest, writeSteerRequestFile } from "./control-files.ts";
-import { readOutputTail, type OutputTail } from "./output-tail.ts";
+import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts";
 import { asyncRunsRoot, isStale, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
 import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail, type ChatGroupSpan } from "./session-view.ts";
@@ -41,9 +41,15 @@ interface Notice {
 	text: string;
 	tone: "info" | "success" | "error";
 	at: number;
+	/** The run this notice describes; shown only while that run is selected.
+	 * A notice about run A displayed under run B was a false statement in the
+	 * one row whose purpose is delivery honesty. */
+	runKey?: string;
 }
 
 interface AckWatch {
+	runKey: string;
+	agent: string;
 	runDir: string;
 	index: number;
 	requestId: string;
@@ -59,16 +65,50 @@ function formatAge(from: number | undefined, now: number): string {
 	return `${Math.round(seconds / 86400)}d`;
 }
 
+const EDIT_OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const EDIT_CSI = /\x1b\[[0-9;:<=>?]*[ -\/]*[@-~]/g;
+const EDIT_SS3 = /\x1bO./g;
+const EDIT_OTHER = /\x1b./g;
+
 /** Keystrokes and pastes, reduced to what a single-line composer accepts.
- * Bracketed-paste markers are stripped, newlines become spaces, and every
- * other control character is dropped — the buffer must never hold a byte that
- * could break a rendered row. */
+ *
+ * Every complete escape sequence is removed WHOLE — arrows, function keys,
+ * mouse reports, bracketed-paste markers — because stripping only the ESC
+ * byte inserted the sequence's tail as literal text: one Up-arrow put `[A`
+ * into a message that was then steered into a live child. Newlines become
+ * spaces and remaining control bytes are dropped; the buffer must never hold
+ * a byte that could break a rendered row. */
 function composerText(data: string): string {
 	return data
-		.replaceAll("\x1b[200~", "")
-		.replaceAll("\x1b[201~", "")
+		.replace(EDIT_OSC, "")
+		.replace(EDIT_CSI, "")
+		.replace(EDIT_SS3, "")
+		.replace(EDIT_OTHER, "")
 		.replace(/\r\n|\r|\n/g, " ")
 		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+}
+
+/** Whether a datum tail beginning with ESC is an escape sequence still being
+ * delivered — terminals split large pastes and even the paste markers across
+ * reads, and consuming half a marker leaves the other half as visible junk.
+ * Held-back bytes are prepended to the next datum instead. */
+function incompleteEscape(tail: string): boolean {
+	if (tail === "\x1b") return true;
+	const kind = tail[1];
+	if (kind === "[") return !/[@-~]/.test(tail.slice(2));
+	if (kind === "]") return !(tail.includes("\x07") || tail.includes("\x1b\\"));
+	if (kind === "O") return tail.length < 3;
+	return false;
+}
+
+/** Append text to a buffer without ever ending on half a surrogate pair — a
+ * blind UTF-16 slice at the cap left a lone surrogate that rendered one
+ * column wider than every width check could see. */
+function capText(text: string, max: number): string {
+	let capped = text.length > max ? text.slice(0, max) : text;
+	const last = capped.charCodeAt(capped.length - 1);
+	if (last >= 0xd800 && last <= 0xdbff) capped = capped.slice(0, -1);
+	return capped;
 }
 
 function firstToolName(record: object): string | undefined {
@@ -117,6 +157,10 @@ export class AgentHubComponent {
 	private searchCursor = -1;
 	private notice: Notice | undefined;
 	private ackWatch: AckWatch | undefined;
+	/** One control action in flight at a time; Enter with nothing visibly
+	 * happening invited re-sends, and each re-send steered the child again. */
+	private actionBusy = false;
+	private editCarry = "";
 	private liveOutput: OutputTail | undefined;
 	private liveOutputFile: string | undefined;
 
@@ -219,18 +263,25 @@ export class AgentHubComponent {
 
 	private pollAck(): void {
 		if (!this.ackWatch) return;
-		const { runDir, index, requestId, sentAt } = this.ackWatch;
+		const { runKey, agent, runDir, index, requestId, sentAt } = this.ackWatch;
 		const ack = findAck(runDir, index, requestId);
 		if (ack) {
-			this.ackWatch = undefined;
-			if (ack.state === "delivered") this.setNotice("delivered to the child", "success");
-			else if (ack.state === "queued") this.setNotice("queued — the child takes it between turns", "info");
-			else this.setNotice(`steer failed: ${ack.message ?? "no reason given"}`, "error");
-			return;
+			// `queued` is a waypoint, not an outcome — keep watching for the
+			// delivered/failed transition instead of declaring victory early.
+			if (ack.state === "queued") {
+				if (this.notice?.runKey !== runKey || !this.notice.text.includes("queued")) {
+					this.setNotice(`${agent}: queued — delivers between turns`, "info", runKey);
+				}
+			} else {
+				this.ackWatch = undefined;
+				if (ack.state === "delivered") this.setNotice(`${agent}: delivered`, "success", runKey);
+				else this.setNotice(`${agent}: steer failed — ${ack.message ?? "no reason given"}`, "error", runKey);
+				return;
+			}
 		}
 		if (Date.now() - sentAt > ACK_WAIT_MS) {
 			this.ackWatch = undefined;
-			this.setNotice("no acknowledgment yet — it stays queued in the run's inbox", "info");
+			this.setNotice(`${agent}: no acknowledgment — it stays queued in the run's inbox`, "info", runKey);
 		}
 	}
 
@@ -259,8 +310,10 @@ export class AgentHubComponent {
 		this.chatMemo = undefined;
 	}
 
-	private setNotice(text: string, tone: Notice["tone"]): void {
-		this.notice = { text, tone, at: Date.now() };
+	private setNotice(text: string, tone: Notice["tone"], runKey?: string): void {
+		// Foreign text reaches this — bridge reply wording, agent names — and a
+		// control byte in a notice is a control byte in a rendered row.
+		this.notice = { text: sanitizeLine(text), tone, at: Date.now(), ...(runKey !== undefined ? { runKey } : {}) };
 		this.tui.requestRender();
 	}
 
@@ -284,6 +337,21 @@ export class AgentHubComponent {
 	}
 
 	private async sendMessage(row: RunRow, text: string): Promise<void> {
+		if (this.actionBusy) {
+			this.setNotice("still sending the previous action…", "info", rowKey(row));
+			return;
+		}
+		this.actionBusy = true;
+		try {
+			await this.sendMessageInner(row, text);
+		} finally {
+			this.actionBusy = false;
+		}
+	}
+
+	private async sendMessageInner(row: RunRow, text: string): Promise<void> {
+		const key = rowKey(row);
+		this.setNotice(`sending to ${row.agent}…`, "info", key);
 		const target = { id: row.runId, ...(row.stepCount > 1 ? { index: row.stepIndex } : {}) };
 		const owns = this.ownsRun(row);
 		if (this.channelFor(row, Date.now()) === "steer") {
@@ -294,13 +362,13 @@ export class AgentHubComponent {
 				if (live) {
 					try {
 						const requestId = writeSteerRequestFile(row.dir, text, row.stepIndex);
-						this.ackWatch = { runDir: row.dir, index: row.stepIndex, requestId, sentAt: Date.now() };
-						this.setNotice("dropped in the runner's inbox — waiting for the ack…", "info");
+						this.ackWatch = { runKey: key, agent: row.agent, runDir: row.dir, index: row.stepIndex, requestId, sentAt: Date.now() };
+						this.setNotice("dropped in the runner's inbox — waiting for the ack…", "info", key);
 					} catch (error) {
-						this.setNotice(error instanceof Error ? error.message : String(error), "error");
+						this.setNotice(error instanceof Error ? error.message : String(error), "error", key);
 					}
 				} else {
-					this.setNotice("view-only: this run belongs to another pi session and has no live runner", "error");
+					this.setNotice("view-only: this run belongs to another pi session and has no live runner", "error", key);
 				}
 				return;
 			}
@@ -311,103 +379,96 @@ export class AgentHubComponent {
 					// No ack watch on this path: the owning extension consumes ack
 					// files itself (read-and-delete), so a watcher here races the
 					// owner and loses — delivery shows up as the child reacting.
-					this.setNotice("steering — the runner delivers it between turns", "success");
+					this.setNotice("steering — the runner delivers it between turns", "success", key);
 				} else {
 					// Honest label for the attached case: the inbox holds it, and
 					// nothing reads that inbox until the run is resumed.
-					this.setNotice("accepted · parked — delivers when this run is resumed", "info");
+					this.setNotice("accepted · parked — delivers when this run is resumed", "info", key);
 				}
 			} else if (outcome.unreachable && live) {
 				// No bridge in this pi, but a live detached runner owns the run:
 				// its file inbox exists exactly for this.
 				try {
 					const requestId = writeSteerRequestFile(row.dir, text, row.stepIndex);
-					this.ackWatch = { runDir: row.dir, index: row.stepIndex, requestId, sentAt: Date.now() };
-					this.setNotice("dropped in the runner's inbox — waiting for the ack…", "info");
+					this.ackWatch = { runKey: key, agent: row.agent, runDir: row.dir, index: row.stepIndex, requestId, sentAt: Date.now() };
+					this.setNotice("dropped in the runner's inbox — waiting for the ack…", "info", key);
 				} catch (error) {
-					this.setNotice(error instanceof Error ? error.message : String(error), "error");
+					this.setNotice(error instanceof Error ? error.message : String(error), "error", key);
 				}
 			} else if (outcome.unreachable) {
-				this.setNotice("no live channel: the subagents extension is not answering and no runner owns this run", "error");
+				this.setNotice("no live channel: the subagents extension is not answering and no runner owns this run", "error", key);
 			} else {
-				this.setNotice(outcome.text || "steer rejected", "error");
+				this.setNotice(outcome.text || "steer rejected", "error", key);
 			}
 			return;
 		}
 		if (owns === false) {
-			this.setNotice("view-only: only the pi session that launched this run can resume it", "error");
+			this.setNotice("view-only: only the pi session that launched this run can resume it", "error", key);
 			return;
 		}
 		const outcome = await this.rpc.resume(target, text);
 		if (this.disposed) return;
 		if (outcome.ok) {
-			this.setNotice("resuming — the child answers here as it works", "success");
+			this.setNotice(`resuming — ${row.agent} answers here as it works`, "success", key);
 			this.refreshRuns();
 		} else if (outcome.unreachable) {
-			this.setNotice("resume needs the subagents extension in this session", "error");
+			this.setNotice("resume needs the subagents extension in this session", "error", key);
 		} else {
-			this.setNotice(outcome.text || "resume rejected", "error");
+			this.setNotice(outcome.text || "resume rejected", "error", key);
 		}
 	}
 
 	private async interruptRun(row: RunRow): Promise<void> {
+		const key = rowKey(row);
 		if (this.channelFor(row, Date.now()) !== "steer") {
-			this.setNotice("nothing to interrupt — this run is not live", "error");
+			this.setNotice("nothing to interrupt — this run is not live", "error", key);
 			return;
 		}
 		if (this.ownsRun(row) === false) {
-			if (runnerReachable(readCapability(row.dir, row.stepIndex))) {
-				try {
-					writeControlRequest(row.dir, "interrupt", "requested from pi-agent-hub");
-					this.setNotice("interrupt dropped in the runner's inbox", "info");
-				} catch (error) {
-					this.setNotice(error instanceof Error ? error.message : String(error), "error");
-				}
-			} else {
-				this.setNotice("view-only: this run belongs to another pi session", "error");
-			}
+			this.fileControlRequest(row, "interrupt");
 			return;
 		}
 		const outcome = await this.rpc.interrupt({ id: row.runId, ...(row.stepCount > 1 ? { index: row.stepIndex } : {}) });
 		if (this.disposed) return;
-		if (outcome.ok) this.setNotice(outcome.text || "interrupt requested", "success");
-		else if (outcome.unreachable && runnerReachable(readCapability(row.dir, row.stepIndex))) {
-			try {
-				writeControlRequest(row.dir, "interrupt", "requested from pi-agent-hub");
-				this.setNotice("interrupt dropped in the runner's inbox", "info");
-			} catch (error) {
-				this.setNotice(error instanceof Error ? error.message : String(error), "error");
-			}
-		} else this.setNotice(outcome.unreachable ? "no channel to interrupt this run" : outcome.text, "error");
+		if (outcome.ok) this.setNotice(outcome.text || "interrupt requested", "success", key);
+		else if (outcome.unreachable) this.fileControlRequest(row, "interrupt");
+		else this.setNotice(outcome.text, "error", key);
+	}
+
+	/** The file-inbox fallback for interrupt/stop, with the same honesty gates
+	 * as steering: a dead runner or a closed inbox means the file would sit
+	 * unread forever, so refuse with the reason instead of claiming delivery. */
+	private fileControlRequest(row: RunRow, kind: "interrupt" | "stop"): void {
+		const key = rowKey(row);
+		if (!runnerReachable(readCapability(row.dir, row.stepIndex))) {
+			this.setNotice(`no channel to ${kind} this run — no live runner owns it`, "error", key);
+			return;
+		}
+		if (steerInboxClosed(row.dir)) {
+			this.setNotice(`the run's inbox is closed — the runner is settling and would not read the ${kind}`, "error", key);
+			return;
+		}
+		try {
+			writeControlRequest(row.dir, kind, "requested from pi-agent-hub");
+			this.setNotice(`${kind} dropped in the runner's inbox`, "info", key);
+		} catch (error) {
+			this.setNotice(error instanceof Error ? error.message : String(error), "error", key);
+		}
 	}
 
 	private async stopRun(row: RunRow): Promise<void> {
+		const key = rowKey(row);
 		if (this.ownsRun(row) === false) {
-			if (runnerReachable(readCapability(row.dir, row.stepIndex))) {
-				try {
-					writeControlRequest(row.dir, "stop", "requested from pi-agent-hub");
-					this.setNotice("stop dropped in the runner's inbox", "info");
-				} catch (error) {
-					this.setNotice(error instanceof Error ? error.message : String(error), "error");
-				}
-			} else {
-				this.setNotice("view-only: this run belongs to another pi session", "error");
-			}
+			this.fileControlRequest(row, "stop");
 			return;
 		}
 		const outcome = await this.rpc.stop({ id: row.runId });
 		if (this.disposed) return;
 		if (outcome.ok) {
-			this.setNotice(outcome.text || "stop requested", "success");
+			this.setNotice(outcome.text || "stop requested", "success", key);
 			this.refreshRuns();
-		} else if (outcome.unreachable && runnerReachable(readCapability(row.dir, row.stepIndex))) {
-			try {
-				writeControlRequest(row.dir, "stop", "requested from pi-agent-hub");
-				this.setNotice("stop dropped in the runner's inbox", "info");
-			} catch (error) {
-				this.setNotice(error instanceof Error ? error.message : String(error), "error");
-			}
-		} else this.setNotice(outcome.unreachable ? "no channel to stop this run" : outcome.text, "error");
+		} else if (outcome.unreachable) this.fileControlRequest(row, "stop");
+		else this.setNotice(outcome.text, "error", key);
 	}
 
 	/** Open the child's cwd / copy its session path. User-invoked one-shots;
@@ -416,7 +477,15 @@ export class AgentHubComponent {
 		if (!row.cwd) return this.setNotice("this run recorded no working directory", "error");
 		const opener = process.platform === "darwin" ? "open" : "xdg-open";
 		try {
-			child_process.spawn(opener, [row.cwd], { detached: true, stdio: "ignore" }).unref();
+			const proc = child_process.spawn(opener, [row.cwd], { detached: true, stdio: "ignore" });
+			// Spawn failure arrives as an async 'error' event; without a listener
+			// it becomes an uncaughtException, and pi answers that with
+			// process.exit(1) — one keypress on a machine without the opener
+			// destroyed the whole session.
+			proc.on("error", error => {
+				if (!this.disposed) this.setNotice(`could not open: ${(error as NodeJS.ErrnoException).code === "ENOENT" ? `${opener} not available` : error.message}`, "error");
+			});
+			proc.unref();
 			this.setNotice(`opening ${row.cwd}`, "info");
 		} catch (error) {
 			this.setNotice(`could not open: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -429,9 +498,16 @@ export class AgentHubComponent {
 		const args = process.platform === "darwin" ? [] : ["-selection", "clipboard"];
 		try {
 			const proc = child_process.spawn(tool, args, { stdio: ["pipe", "ignore", "ignore"] });
-			proc.on("error", () => this.setNotice(`copy failed (${tool} not available)`, "error"));
+			proc.on("error", () => {
+				if (!this.disposed) this.setNotice(`copy failed (${tool} not available)`, "error");
+			});
+			// Claimed only once it happened: the success notice used to appear
+			// before the tool had run, then correct itself to a failure.
+			proc.on("close", code => {
+				if (!this.disposed && code === 0) this.setNotice("session path copied", "success");
+			});
+			proc.stdin.on("error", () => {});
 			proc.stdin.end(row.sessionFile);
-			this.setNotice("session path copied", "success");
 		} catch (error) {
 			this.setNotice(`copy failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
@@ -488,6 +564,10 @@ export class AgentHubComponent {
 			else this.setNotice("match no longer retained", "info");
 			return;
 		}
+		// A cold jump renders every record between the tail and the target —
+		// measured 407ms worst-case on a 50MB session (316 retained records),
+		// once, warm 0ms after. Accepted: it is user-invoked, bounded by
+		// MAX_RECORDS, and the alternative is a scroll position that lies.
 		const offset = bottomOffsetOfRecord(this.tail, recordIndex, this.lastChatWidth || 80, this.chatOptions());
 		if (offset === undefined) return;
 		this.chatScroll = Math.max(0, offset - this.lastChatHeight);
@@ -604,10 +684,12 @@ export class AgentHubComponent {
 		const composing = this.mode === "compose";
 		if (data === "\x1b" || data === "\x03") {
 			this.mode = "nav";
+			this.editCarry = "";
 			this.tui.requestRender();
 			return;
 		}
 		if (data === "\r" || data === "\n") {
+			this.editCarry = "";
 			if (composing) {
 				const row = this.selectedRow();
 				const text = this.composer.trim();
@@ -633,13 +715,22 @@ export class AgentHubComponent {
 			this.tui.requestRender();
 			return;
 		}
-		const text = composerText(data);
+		let combined = this.editCarry + data;
+		this.editCarry = "";
+		// Hold back an escape sequence still being delivered — the paste
+		// markers themselves split across reads — rather than mangle its halves.
+		const lastEscape = combined.lastIndexOf("\x1b");
+		if (lastEscape !== -1 && incompleteEscape(combined.slice(lastEscape))) {
+			this.editCarry = combined.slice(lastEscape);
+			combined = combined.slice(0, lastEscape);
+		}
+		const text = composerText(combined);
 		if (!text) return;
 		if (composing) {
-			this.composer = (this.composer + text).slice(0, COMPOSER_MAX_CHARS);
-			if (this.composer.length === COMPOSER_MAX_CHARS) this.setNotice("message is at the 8000-character cap", "info");
+			this.composer = capText(this.composer + text, COMPOSER_MAX_CHARS);
+			if (this.composer.length >= COMPOSER_MAX_CHARS - 1) this.setNotice("message is at the 8000-character cap", "info");
 		} else {
-			this.searchInput = (this.searchInput + text).slice(0, 200);
+			this.searchInput = capText(this.searchInput + text, 200);
 		}
 		this.tui.requestRender();
 	}
@@ -749,34 +840,63 @@ export class AgentHubComponent {
 		if (this.mode === "compose" || this.mode === "search") {
 			const composing = this.mode === "compose";
 			const channel = composing && row ? this.channelFor(row, now) : undefined;
-			const label = composing ? `${channel} → ${row?.agent ?? "?"}` : "find";
+			const label = composing ? `${channel} → ${sanitizeLine(row?.agent ?? "?")}` : "find";
 			const buffer = composing ? this.composer : this.searchInput;
 			const prompt = `${this.theme.fg("accent", label)} ${dim("›")} `;
 			const room = Math.max(8, width - visibleWidth(prompt) - 2);
-			let shown = buffer.length > room * 2 ? buffer.slice(-room * 2) : buffer;
-			while (visibleWidth(shown) > room) shown = `…${shown.slice(2)}`;
+			// Built from whole code points, tail-first, measuring only what the
+			// row can hold: the unit-blind loop both split surrogate pairs and
+			// re-measured an 8000-char buffer per shaved character — tens of
+			// milliseconds on every keystroke.
+			let shown = buffer;
+			if (visibleWidth(buffer) > room) {
+				const characters = Array.from(buffer);
+				const kept: string[] = [];
+				let used = 1; // the ellipsis cell
+				for (let index = characters.length - 1; index >= 0; index--) {
+					const cell = visibleWidth(characters[index]!);
+					if (used + cell > room) break;
+					used += cell;
+					kept.push(characters[index]!);
+				}
+				shown = `…${kept.reverse().join("")}`;
+			}
 			return `${prompt}${shown}${this.theme.fg("accent", "▌")}`;
 		}
 		if (this.mode === "confirmStop") {
-			return this.theme.fg("error", `⚠ stop ${row?.agent ?? "this run"} (${row?.runId.slice(0, 8) ?? "?"})? press D again to confirm`);
+			return this.theme.fg("error", `⚠ stop ${sanitizeLine(row?.agent ?? "this run")} (${sanitizeLine(row?.runId ?? "?").slice(0, 8)})? press D again to confirm`);
 		}
-		if (this.notice) {
+		if (this.notice && (this.notice.runKey === undefined || this.notice.runKey === this.selectedKey)) {
 			const tone = this.notice.tone === "error" ? "error" : this.notice.tone === "success" ? "success" : "dim";
 			return this.theme.fg(tone, this.notice.text);
 		}
 		if (this.focusedRecord) {
-			const name = firstToolName(this.focusedRecord) ?? "tools";
+			const name = sanitizeLine(firstToolName(this.focusedRecord) ?? "tools");
 			return dim(`focused ⟨${name}⟩ · x expand/collapse · t next · T back`);
 		}
 		if (row) {
 			const channel = this.channelFor(row, now);
-			if (this.ownsRun(row) === false && !(channel === "steer" && runnerReachable(readCapability(row.dir, row.stepIndex)))) {
+			if (this.ownsRun(row) === false && !(channel === "steer" && this.cachedRunnerProbe(row, now))) {
 				return dim("view-only · launched by another pi session · o cwd · y copy path");
 			}
 			const explain = channel === "steer" ? "s steers the running child" : row.state === "running" ? "s revives this stalled run" : "s resumes the conversation";
 			return dim(`${explain} · i interrupt · D stop · o cwd · y copy path`);
 		}
 		return dim("no run selected");
+	}
+
+	private runnerProbe: { key: string; at: number; live: boolean } | undefined;
+
+	/** The action row renders every frame; a capability read plus a signal-0
+	 * per frame for a foreign run is filesystem work paid 25 times a second
+	 * for a value that changes on runner lifecycle. Cached briefly — the send
+	 * path always probes fresh, where the answer actually gates a write. */
+	private cachedRunnerProbe(row: RunRow, now: number): boolean {
+		const key = rowKey(row);
+		if (this.runnerProbe?.key === key && now - this.runnerProbe.at < 1500) return this.runnerProbe.live;
+		const live = runnerReachable(readCapability(row.dir, row.stepIndex));
+		this.runnerProbe = { key, at: now, live };
+		return live;
 	}
 
 	private stateGlyph(row: RunRow, now: number): string {
@@ -808,9 +928,13 @@ export class AgentHubComponent {
 			const marker = selected ? this.theme.fg("accent", "▸") : " ";
 			const stale = isStale(row, now);
 			const age = formatAge(row.lastActivityAt ?? row.lastUpdate, now);
-			const detail = stale ? "stale" : row.state === "running" ? (row.currentTool ?? "…") : row.state;
+			// Agent, tool and state strings come from another extension's
+			// status.json — from names a model may have picked. A control byte
+			// there clears the user's screen mid-frame; strip before drawing.
+			const detail = sanitizeLine(stale ? "stale" : row.state === "running" ? (row.currentTool ?? "…") : row.state);
 			const step = row.stepCount > 1 ? `#${row.stepIndex} ` : "";
-			const name = selected ? this.theme.bold(row.agent) : row.agent;
+			const agent = sanitizeLine(row.agent);
+			const name = selected ? this.theme.bold(agent) : agent;
 			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${name} ${this.theme.fg("dim", `${step}· ${detail}${age ? ` · ${age}` : ""}`)}`, width));
 		}
 		// Inside the budget, not appended past it: a line beyond the frame's
@@ -858,8 +982,8 @@ export class AgentHubComponent {
 		// raw claimed "running" for a run whose heartbeat had stopped, one
 		// column away from a row already calling it stale.
 		const stale = isStale(row, now);
-		const state = stale ? "stale" : row.state;
-		const header = `${this.theme.fg("toolTitle", this.theme.bold(row.agent))} ${dim(`· ${state}${row.model ? ` · ${row.model}` : ""} · ${row.runId.slice(0, 8)}`)}`;
+		const state = sanitizeLine(stale ? "stale" : row.state);
+		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${row.model ? ` · ${sanitizeLine(row.model)}` : ""} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
 		const paneHeight = Math.max(1, height - 2);
 		// One row is reserved for the scroll indicator, and a block for the live
 		// output tail — reserved, not overwritten, so neither costs content.

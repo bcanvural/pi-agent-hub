@@ -63,6 +63,10 @@ let requestCounter = 0;
 export class SubagentsRpc {
 	private readonly offReady: () => void;
 	private manifestSeen = false;
+	private identifyAttempts = 0;
+	/** Reply subscriptions still waiting; dispose releases them rather than
+	 * leaving handlers on pi's global bus until their timeouts fire. */
+	private readonly pending = new Set<() => void>();
 	/** The session the bridge lives in. Control is scoped to it upstream, so
 	 * ownership decides which runs the RPC will act on at all. */
 	sessionId: string | undefined;
@@ -87,9 +91,12 @@ export class SubagentsRpc {
 		else if (typeof session?.sessionId === "string") this.sessionId = session.sessionId;
 	}
 
-	/** One ping to learn the session id when the ready broadcast predates us. */
+	/** One ping to learn the session id when the ready broadcast predates us.
+	 * Bounded: a bridge that answers without a session (no UI context yet)
+	 * would otherwise be re-pinged every refresh tick forever. */
 	async identify(): Promise<void> {
-		if (this.sessionId !== undefined) return;
+		if (this.sessionId !== undefined || this.identifyAttempts >= 3) return;
+		this.identifyAttempts++;
 		const reply = await this.call("ping", undefined, 3000);
 		if (reply?.success) this.captureSession(reply.data);
 	}
@@ -108,12 +115,14 @@ export class SubagentsRpc {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
+				this.pending.delete(unsubscribe);
 				unsubscribe();
 				resolve(reply);
 			};
 			const unsubscribe = this.events.on(`${REPLY_PREFIX}${requestId}`, raw => {
 				finish(typeof raw === "object" && raw !== null ? (raw as RpcReply) : { success: false });
 			});
+			this.pending.add(unsubscribe);
 			const timer = setTimeout(() => finish(undefined), timeoutMs);
 			this.events.emit(REQUEST_EVENT, {
 				version: 1,
@@ -149,7 +158,7 @@ export class SubagentsRpc {
 	private async action(method: string, params: Record<string, unknown>): Promise<ActionOutcome> {
 		const reply = await this.call(method, params, 10_000);
 		if (reply === undefined) return { ok: false, unreachable: true, text: "no answer from the subagents extension" };
-		if (!reply.success) return { ok: false, text: reply.error?.message ?? `subagents rejected the ${method}` };
+		if (!reply.success) return { ok: false, text: typeof reply.error?.message === "string" ? reply.error.message : `subagents rejected the ${method}` };
 		const data = reply.data ?? {};
 		const details = (data.details ?? {}) as { steering?: ActionOutcome["steering"] };
 		const text = String((data as { text?: unknown }).text ?? "").split("\n")[0] ?? "";
@@ -174,5 +183,7 @@ export class SubagentsRpc {
 
 	dispose(): void {
 		this.offReady();
+		for (const unsubscribe of this.pending) unsubscribe();
+		this.pending.clear();
 	}
 }
