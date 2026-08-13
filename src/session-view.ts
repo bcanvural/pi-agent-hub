@@ -148,15 +148,23 @@ export class SessionTail {
 		// leave a rewrite only those few bytes to match by chance. Copied, not
 		// sliced — a subarray is a view that would hold the whole concatenation
 		// alive, which after a large append is megabytes kept for 64 bytes.
-		this.anchor = Buffer.from(Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES));
+		// Concatenating only when the chunk is too short to fill the window
+		// avoids copying a whole large append to take its last few bytes.
+		this.anchor = chunk.length >= ANCHOR_BYTES
+			? Buffer.from(chunk.subarray(-ANCHOR_BYTES))
+			: Buffer.from(Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES));
 
 		const data = this.leftover.length > 0 ? Buffer.concat([this.leftover, chunk]) : chunk;
 		const lastNewline = data.lastIndexOf(0x0a);
 		if (lastNewline === -1) {
-			this.leftover = data;
+			this.leftover = data === chunk ? Buffer.from(data) : data;
 			return false;
 		}
-		this.leftover = data.subarray(lastNewline + 1);
+		// Copied for the same reason as the anchor: a view would pin the whole
+		// read alive, and a poll landing mid-write leaves a partial line every
+		// time — on first attach that is the entire tail window held for a few
+		// bytes, and a child that died mid-write never completes the line.
+		this.leftover = Buffer.from(data.subarray(lastNewline + 1));
 
 		let appended = false;
 		for (let line of data.subarray(0, lastNewline).toString("utf8").split("\n")) {
@@ -256,7 +264,10 @@ const groupCache = new WeakMap<object, GroupCacheEntry>();
 
 function capToolLines(lines: string[], expanded: boolean, width: number, dim: (text: string) => string): string[] {
 	const base = expanded ? TOOL_LINES_EXPANDED : TOOL_LINES_COLLAPSED;
-	const budget = Math.max(base, Math.round((base * TOOL_BUDGET_REFERENCE_WIDTH) / Math.max(1, width)));
+	// Ceiling as well as floor, so the bound holds on its own rather than on a
+	// minimum pane width enforced by the caller in another file.
+	const scaled = Math.round((base * TOOL_BUDGET_REFERENCE_WIDTH) / Math.max(1, width));
+	const budget = Math.min(base * 5, Math.max(base, scaled));
 	if (lines.length <= budget) return lines;
 	const tailKeep = Math.max(1, budget - TOOL_HEAD_LINES - 1);
 	const hidden = lines.length - TOOL_HEAD_LINES - tailKeep;
