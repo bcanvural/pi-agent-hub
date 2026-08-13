@@ -85,6 +85,12 @@ const EDIT_OTHER = /\x1b./g;
  * a paste boundary froze the composer while the carry ate 20,000 characters.
  * Sequence payloads are never message text, so the overflow is dropped. */
 const EDIT_CARRY_MAX = 16;
+/** Bytes the discard state may consume before giving up. A pasted truncated
+ * capture has no terminator; swallowing keystrokes silently forever is the
+ * freeze this machinery exists to prevent, so past the budget the discard
+ * clears and says so. Sized for real string payloads (OSC-8 URLs, DECRQSS)
+ * while keeping the worst silent swallow bounded and announced. */
+const EDIT_DISCARD_MAX = 4096;
 
 /** Keystrokes and pastes, reduced to what a single-line composer accepts.
  *
@@ -191,8 +197,13 @@ export class AgentHubComponent {
 	/** Set when a held sequence overflowed the carry bound: the rest of that
 	 * sequence is still arriving, and dropping the carry alone let the
 	 * remainder land as literal text — half a pasted URL in the message.
-	 * Until the sequence's terminator passes, incoming bytes belong to it. */
-	private editDiscard: "st" | "csi" | undefined;
+	 * Until the sequence's terminator passes, incoming bytes belong to it.
+	 * `pendingEsc` remembers a datum that ended on the first byte of a split
+	 * ST — without it, a terminator straddling a read boundary was never seen
+	 * and the discard became the freeze it was built to prevent. `spent` is
+	 * the byte budget: a truncated capture has no terminator at all, and an
+	 * unbounded discard swallows keystrokes silently forever. */
+	private editDiscard: { kind: "st" | "csi"; pendingEsc: boolean; spent: number } | undefined;
 	private liveOutput: OutputTail | undefined;
 	private liveOutputFile: string | undefined;
 
@@ -826,20 +837,32 @@ export class AgentHubComponent {
 		// Finish discarding a sequence whose head already overflowed the carry:
 		// everything up to its terminator is sequence payload, not typing.
 		if (this.editDiscard) {
-			const end = this.editDiscard === "st"
-				? (() => {
+			const discard = this.editDiscard;
+			let end = -1;
+			if (discard.kind === "st") {
+				if (discard.pendingEsc) {
+					discard.pendingEsc = false;
+					if (payload.startsWith("\\")) end = 1;
+				}
+				if (end === -1) {
 					const bel = payload.indexOf("\x07");
 					const st = payload.indexOf("\x1b\\");
-					if (bel === -1 && st === -1) return -1;
-					if (bel === -1) return st + 2;
-					if (st === -1) return bel + 1;
-					return Math.min(bel + 1, st + 2);
-				})()
-				: (() => {
-					const final = /[@-~]/.exec(payload);
-					return final ? final.index + 1 : -1;
-				})();
-			if (end === -1) return;
+					if (bel !== -1 && (st === -1 || bel < st)) end = bel + 1;
+					else if (st !== -1) end = st + 2;
+					else if (payload.endsWith("\x1b")) discard.pendingEsc = true;
+				}
+			} else {
+				const final = /[@-~]/.exec(payload);
+				if (final) end = final.index + 1;
+			}
+			if (end === -1) {
+				discard.spent += payload.length;
+				if (discard.spent > EDIT_DISCARD_MAX) {
+					this.editDiscard = undefined;
+					this.setNotice("an unterminated escape sequence in the input was ignored — check the message before sending", "info");
+				}
+				return;
+			}
 			payload = payload.slice(end);
 			this.editDiscard = undefined;
 			if (!payload) return;
@@ -857,7 +880,7 @@ export class AgentHubComponent {
 		if (lastEscape !== -1 && incompleteEscape(combined.slice(lastEscape))) {
 			const held = combined.slice(lastEscape);
 			if (held.length > EDIT_CARRY_MAX) {
-				this.editDiscard = held[1] === "[" || held[1] === "O" ? "csi" : "st";
+				this.editDiscard = { kind: held[1] === "[" || held[1] === "O" ? "csi" : "st", pendingEsc: held.endsWith("\x1b") && held.length > 1, spent: held.length };
 			} else {
 				this.editCarry = held;
 			}

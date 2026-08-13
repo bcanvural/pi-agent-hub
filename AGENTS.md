@@ -96,3 +96,8 @@ history.
   synthetic fixture. Live children for end-to-end checks are spawned in a
   scratch project and cost real tokens — keep tasks trivial.
 - pi swallows Tab before overlays see it; overlay keybindings avoid it.
+- `handleEditingInput` (hub.ts) is the changeset's proven regression magnet:
+  four review rounds each found their new defect inside this one function.
+  It now carries a sequence carry, a bound, and a budgeted discard state with
+  explicit invariants — if you touch it, extend the state machine; do not add
+  a fifth conditional.
