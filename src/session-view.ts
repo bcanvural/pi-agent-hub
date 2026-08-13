@@ -145,8 +145,10 @@ export class SessionTail {
 		if (chunk.length === 0) return false;
 		// Carried forward, not taken from this chunk alone: a writer flushing a
 		// partial line delivers a handful of bytes, and anchoring on those would
-		// leave a rewrite only those few bytes to match by chance.
-		this.anchor = Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES);
+		// leave a rewrite only those few bytes to match by chance. Copied, not
+		// sliced — a subarray is a view that would hold the whole concatenation
+		// alive, which after a large append is megabytes kept for 64 bytes.
+		this.anchor = Buffer.from(Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES));
 
 		const data = this.leftover.length > 0 ? Buffer.concat([this.leftover, chunk]) : chunk;
 		const lastNewline = data.lastIndexOf(0x0a);
