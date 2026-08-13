@@ -20,6 +20,7 @@ export interface RunRow {
 	state: string;
 	stepStatus: string;
 	model?: string;
+	thinking?: string;
 	mode?: string;
 	cwd?: string;
 	startedAt?: number;
@@ -103,6 +104,7 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			state: asString(status.state) ?? "unknown",
 			stepStatus: asString(step.status) ?? "unknown",
 			model: asString(step.model),
+			thinking: asString(step.thinking),
 			mode: asString(status.mode),
 			cwd: asString(status.cwd),
 			startedAt: asNumber(step.startedAt) ?? asNumber(status.startedAt),

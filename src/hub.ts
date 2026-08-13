@@ -56,6 +56,22 @@ interface AckWatch {
 	sentAt: number;
 }
 
+/** omp-style compact duration: `2m54s`, `1h12m`, `45s`. */
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m${seconds % 60 ? `${seconds % 60}s` : ""}`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
+}
+
+function shortModel(model: string | undefined): string | undefined {
+	if (!model) return undefined;
+	const short = model.split("/").pop();
+	return short || model;
+}
+
 function formatAge(from: number | undefined, now: number): string {
 	if (!from) return "";
 	const seconds = Math.max(0, Math.round((now - from) / 1000));
@@ -938,14 +954,18 @@ export class AgentHubComponent {
 		const dim = (text: string): string => this.theme.fg("dim", text);
 		const border = (text: string): string => this.theme.fg("borderMuted", text);
 		const terminalRows = (this.tui as unknown as { terminal?: { rows?: number } }).terminal?.rows ?? 40;
-		const height = Math.max(14, Math.min(Math.floor(terminalRows * 0.85) - 2, terminalRows - 4));
+		// ~78% of the terminal: pi centers the overlay on the component's own
+		// height, and a panel that claims almost everything reads as glued to
+		// the top — the margins have to be visible for "floating" to be true.
+		const height = Math.max(16, Math.min(Math.floor(terminalRows * 0.78), terminalRows - 6));
 		// The panel draws its own frame — the overlay paints no border of its
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
-		// Title, body, the action row, bottom border.
-		const bodyHeight = height - 3;
+		// Title, aggregate stats, body, the action row, bottom border, and the
+		// hint bar below the frame (omp keeps its key hints outside the box).
+		const bodyHeight = height - 5;
 		this.lastChatHeight = Math.max(1, bodyHeight - 2);
-		const listWidth = Math.min(38, Math.max(24, Math.floor(innerWidth * 0.28)));
+		const listWidth = Math.min(48, Math.max(26, Math.floor(innerWidth * 0.32)));
 		const chatWidth = Math.max(20, innerWidth - listWidth - 3);
 
 		const pad = (text: string, target: number): string => {
@@ -954,36 +974,46 @@ export class AgentHubComponent {
 			return deficit > 0 ? clipped + " ".repeat(deficit) : clipped;
 		};
 
-		// The two numbers count different populations and must say so. The run
-		// count is the scan of this machine's shared artifact root — every pi
-		// session this user has run. The active count comes from the subagents
-		// bridge, which reports only the session we are inside, foreground
-		// delegations included. Printed side by side without their scopes they
-		// read as a contradiction whenever either is non-zero on its own.
-		const runs = `${this.rows.length} run${this.rows.length === 1 ? "" : "s"} on this machine`;
-		const link = !this.rpcInfo.available
-			? dim("· subagents not answering")
-			: this.rpcInfo.totalActive === undefined
-				? this.theme.fg("success", "· linked")
-				: this.theme.fg("success", `· ${this.rpcInfo.totalActive} active in this session`);
-		const title = ` ${this.theme.bold("Agent hub")} ${dim(`· ${runs} `)}${link} `;
-		const hints = ` ${dim(this.bottomHints())} `;
+		const title = ` ${this.theme.fg("accent", this.theme.bold("Agent Hub"))} `;
+
+		// The two counts describe different populations and must say so. The
+		// run count is the scan of this machine's shared artifact root — every
+		// pi session this user has run. The active count comes from the
+		// subagents bridge, which reports only the session we are inside,
+		// foreground delegations included.
+		const running = this.rows.filter(row => row.state === "running" && !isStale(row, now)).length;
+		const sessionTokens = this.rpcInfo.entries.reduce((sum, entry) => sum + (entry.tokens?.total ?? 0), 0);
+		const statsParts = [
+			running > 0 ? this.theme.fg("warning", `⟳ ${running} running`) : dim("nothing running"),
+			dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} on this machine`),
+			!this.rpcInfo.available
+				? dim("subagents not answering")
+				: this.rpcInfo.totalActive === undefined
+					? this.theme.fg("success", "linked")
+					: this.theme.fg("success", `${this.rpcInfo.totalActive} active in this session`),
+			...(sessionTokens > 0 ? [dim(`${sessionTokens >= 1000 ? `${(sessionTokens / 1000).toFixed(1)}K` : sessionTokens} tok this session`)] : []),
+		];
+		const stats = statsParts.join(dim(" · "));
 
 		const frameRow = (content: string, left: string, right: string): string => {
 			const fill = Math.max(0, width - left.length - right.length - visibleWidth(content));
 			return truncateToWidth(`${border(left)}${content}${border("─".repeat(fill))}${border(right)}`, width);
 		};
+		const framed = (content: string): string => truncateToWidth(`${border("│")} ${pad(content, width - 4)} ${border("│")}`, width);
 
 		const lines: string[] = [frameRow(truncateToWidth(title, width - 4), "╭─", "╮")];
+		lines.push(framed(truncateToWidth(stats, innerWidth)));
 		const listLines = this.renderList(listWidth, bodyHeight, now);
 		const chatLines = this.renderChat(chatWidth, bodyHeight);
 		const separator = border("│");
 		for (let index = 0; index < bodyHeight; index++) {
 			const inner = `${pad(listLines[index] ?? "", listWidth)} ${separator} ${pad(chatLines[index] ?? "", chatWidth)}`;
-			lines.push(truncateToWidth(`${border("│")} ${pad(inner, width - 4)} ${border("│")}`, width));
+			lines.push(framed(inner));
 		}
-		lines.push(truncateToWidth(`${border("│")} ${pad(this.renderActionRow(innerWidth, now), width - 4)} ${border("│")}`, width));
-		lines.push(frameRow(truncateToWidth(hints, width - 4), "╰─", "╯"));
+		lines.push(framed(this.renderActionRow(innerWidth, now)));
+		lines.push(frameRow("", "╰─", "╯"));
+		// Outside the frame, the way omp carries its key hints.
+		lines.push(truncateToWidth(` ${dim(this.bottomHints())}`, width));
 		return lines;
 	}
 
@@ -1063,48 +1093,70 @@ export class AgentHubComponent {
 	}
 
 	private stateGlyph(row: RunRow, now: number): string {
-		if (isStale(row, now)) return this.theme.fg("muted", "●");
-		if (row.state === "running") return this.theme.fg("warning", "●");
+		if (isStale(row, now)) return this.theme.fg("muted", "⟳");
+		if (row.state === "running") return this.theme.fg("warning", "⟳");
 		if (row.state === "complete") return this.theme.fg("success", "✓");
 		if (row.state === "failed") return this.theme.fg("error", "✗");
 		return this.theme.fg("muted", "■");
 	}
 
 	private renderList(width: number, fullHeight: number, now: number): string[] {
-		// Reserve the notice's row up front. Overwriting the last row instead
+		const dim = (text: string): string => this.theme.fg("dim", text);
+		// Reserve the notice's line up front. Overwriting the last row instead
 		// erased the selection when the cursor was on it — the list lost its
 		// cursor entirely at the moment the notice appeared.
 		const capped = this.rows.length === MAX_ROWS;
-		const height = Math.max(1, capped ? fullHeight - 1 : fullHeight);
+		const height = Math.max(2, capped ? fullHeight - 1 : fullHeight);
 		if (this.rows.length === 0) {
-			return [this.theme.fg("dim", "no runs found"), this.theme.fg("dim", "launch a background agent"), this.theme.fg("dim", "and it appears here")];
+			return [dim("no runs found"), dim("launch a background agent"), dim("and it appears here")];
 		}
+		// Two lines per entry, the way omp's roster reads: the name row with
+		// the model and recency right-aligned, then a dim per-run stats row.
+		const visibleEntries = Math.max(1, Math.floor(height / 2));
 		const selectedIndex = Math.max(0, this.rows.findIndex(row => rowKey(row) === this.selectedKey));
 		if (selectedIndex < this.listWindowTop) this.listWindowTop = selectedIndex;
-		if (selectedIndex >= this.listWindowTop + height) this.listWindowTop = selectedIndex - height + 1;
-		this.listWindowTop = Math.max(0, Math.min(this.listWindowTop, Math.max(0, this.rows.length - height)));
+		if (selectedIndex >= this.listWindowTop + visibleEntries) this.listWindowTop = selectedIndex - visibleEntries + 1;
+		this.listWindowTop = Math.max(0, Math.min(this.listWindowTop, Math.max(0, this.rows.length - visibleEntries)));
 
 		const lines: string[] = [];
-		for (let index = this.listWindowTop; index < Math.min(this.rows.length, this.listWindowTop + height); index++) {
+		for (let index = this.listWindowTop; index < Math.min(this.rows.length, this.listWindowTop + visibleEntries); index++) {
 			const row = this.rows[index]!;
 			const selected = index === selectedIndex;
 			const marker = selected ? this.theme.fg("accent", "▸") : " ";
 			const stale = isStale(row, now);
-			const age = formatAge(row.lastActivityAt ?? row.lastUpdate, now);
-			// Agent, tool and state strings come from another extension's
+			// Agent, tool, state and model strings come from another extension's
 			// status.json — from names a model may have picked. A control byte
 			// there clears the user's screen mid-frame; strip before drawing.
-			const detail = sanitizeLine(stale ? "stale" : row.state === "running" ? (row.currentTool ?? "…") : row.state);
-			const step = row.stepCount > 1 ? `#${row.stepIndex} ` : "";
 			const agent = sanitizeLine(row.agent);
 			const name = selected ? this.theme.bold(agent) : agent;
-			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${name} ${this.theme.fg("dim", `${step}· ${detail}${age ? ` · ${age}` : ""}`)}`, width));
+			const age = formatAge(row.lastActivityAt ?? row.lastUpdate, now);
+			const model = sanitizeLine([shortModel(row.model), row.thinking].filter(Boolean).join(" ⏻ "));
+			// Right-aligned model · age; the model yields first when the pane is
+			// too narrow to hold both it and a readable name.
+			let right = [model, age].filter(Boolean).join(" · ");
+			if (right && visibleWidth(right) > width - 10) right = age;
+			const rightStyled = right ? dim(right) : "";
+			const leftBudget = Math.max(4, width - (right ? visibleWidth(right) + 1 : 0) - 3);
+			const nameShown = truncateToWidth(name, leftBudget);
+			const gap = Math.max(1, width - 3 - visibleWidth(nameShown) - visibleWidth(right));
+			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${nameShown}${" ".repeat(gap)}${rightStyled}`, width));
+
+			const detail = sanitizeLine(stale ? "stale" : row.state === "running" ? (row.currentTool ?? "…") : row.state);
+			const step = row.stepCount > 1 ? `#${row.stepIndex} · ` : "";
+			const active = row.startedAt !== undefined ? formatDuration((row.lastActivityAt ?? row.lastUpdate ?? row.startedAt) - row.startedAt) : "";
+			const statsParts = [
+				`${step}${detail}`,
+				...(active ? [`${active} active`] : []),
+				...(row.turnCount !== undefined ? [`${row.turnCount} req`] : []),
+				...(row.toolCount !== undefined ? [`${row.toolCount} tools`] : []),
+			];
+			lines.push(truncateToWidth(`   ${dim(statsParts.join(" · "))}`, width));
 		}
 		// Inside the budget, not appended past it: a line beyond the frame's
 		// height is cropped and the notice never reaches the reader.
 		if (capped) {
 			while (lines.length < height) lines.push("");
-			lines.push(this.theme.fg("dim", `showing newest ${MAX_ROWS} · r to rescan`));
+			lines.push(dim(`showing newest ${MAX_ROWS} · r to rescan`));
 		}
 		return lines;
 	}
