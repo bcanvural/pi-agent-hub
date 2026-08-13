@@ -1053,7 +1053,7 @@ export class AgentHubComponent {
 	}
 
 	private bottomHints(): string {
-		if (this.mode === "compose") return "enter send · esc cancel · ctrl+u clear";
+		if (this.mode === "compose") return "enter send · esc cancel";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
 		return "↑/↓ select · J/K·u/d scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
