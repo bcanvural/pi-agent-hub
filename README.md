@@ -26,9 +26,11 @@ message components**, so a child's conversation looks exactly like the main
 window — including whatever theming or framing other extensions apply to
 those components.
 
-Run discovery and liveness come from pi-subagents' versioned cross-extension
-RPC (`subagents:rpc:v1:*` on pi's event bus), with a filtered disk scan as
-the fallback when the bridge is absent.
+Runs are discovered by scanning pi-subagents' artifact root — the only place
+that records a run's id and its child's session file. Its versioned
+cross-extension RPC (`subagents:rpc:v1:*` on pi's event bus) supplies the
+liveness badge alongside. The two count different populations, so the header
+names each: the scan is machine-wide, the RPC reports only this session.
 
 ## Use
 
@@ -49,8 +51,14 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 
 ## Status
 
-v0 — observe. Runs are listed newest-first (session-per-step), stale
+v0 — observe. Runs are listed newest-first (one row per step), stale
 "running" records from dead parents are labelled rather than believed, and
-the conversation follows the session file as it grows. Steering, resume
-conversations, and interrupt/stop controls are designed (see `DESIGN.md`)
-and land next.
+the conversation follows the session file as it grows.
+
+Only the visible window is rendered, so cost tracks the viewport rather than
+the session: a cold pane on a 7 MB transcript is ~40 ms, and every record is
+rendered behind a catch, because an exception raised inside pi's render pass
+takes the whole session down with it.
+
+Steering, resume conversations, and interrupt/stop controls are designed (see
+`DESIGN.md`) and land next.

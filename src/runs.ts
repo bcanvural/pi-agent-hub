@@ -85,7 +85,7 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 	if (typeof raw !== "object" || raw === null) return [];
 	const status = raw as Record<string, unknown>;
 	const runId = asString(status.runId) ?? path.basename(dir);
-	const steps = Array.isArray(status.steps) ? status.steps : [];
+	const steps = Array.isArray(status.steps) && status.steps.length > 0 ? status.steps : [{}];
 	const rows: RunRow[] = [];
 	for (let index = 0; index < steps.length; index++) {
 		const step = (typeof steps[index] === "object" && steps[index] !== null ? steps[index] : {}) as Record<string, unknown>;
@@ -161,6 +161,9 @@ export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunR
 	return kept.slice(0, MAX_ROWS);
 }
 
+/** Unique by construction: two runs cannot share a directory, where two could
+ * in principle share a recorded runId. A collision made the list unnavigable,
+ * since every lookup resolved to the first of the pair. */
 export function rowKey(row: RunRow): string {
-	return `${row.runId}:${row.stepIndex}`;
+	return `${row.dir}:${row.stepIndex}`;
 }

@@ -5,7 +5,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { asyncRunsRoot, isStale, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
-import { buildChatLines, SessionTail } from "./session-view.ts";
+import { buildChatWindow, SessionTail } from "./session-view.ts";
 
 const LIST_REFRESH_MS = 2000;
 const TAIL_POLL_MS = 500;
@@ -14,8 +14,12 @@ interface ChatMemo {
 	recordCount: number;
 	truncatedHead: boolean;
 	width: number;
+	height: number;
 	expandedTools: boolean;
+	scroll: number;
 	lines: string[];
+	linesKnown: number;
+	atOldest: boolean;
 }
 
 function formatAge(from: number | undefined, now: number): string {
@@ -67,8 +71,11 @@ export class AgentHubComponent {
 	private refreshRuns(): void {
 		if (this.disposed) return;
 		this.rows = scanRuns(asyncRunsRoot(), this.scanCache);
-		if (this.selectedKey === undefined || !this.rows.some(row => rowKey(row) === this.selectedKey)) {
-			this.select(this.rows.length > 0 ? rowKey(this.rows[0]!) : undefined);
+		const wanted = this.rows.length > 0 ? rowKey(this.rows[0]!) : undefined;
+		if (!this.rows.some(row => rowKey(row) === this.selectedKey)) {
+			// Only when it actually changes: re-selecting `undefined` on an empty
+			// root asked for a repaint every couple of seconds, forever.
+			if (this.selectedKey !== wanted) this.select(wanted);
 		} else {
 			// The selected run may have moved to a session file it lacked at
 			// selection time (spawn order writes status before the child exists).
@@ -163,11 +170,15 @@ export class AgentHubComponent {
 
 	private lastChatHeight = 10;
 
+	/** Scroll is only ever adjusted here; the clamp belongs to render, which is
+	 * the one place that knows how many lines exist. Clamping here against a
+	 * memo that a tail poll may have just cleared read as "jump to the live
+	 * tail", so a reader scrolled back through a growing conversation was
+	 * yanked to the bottom every time the child spoke. */
 	private scrollChat(delta: number): void {
-		const total = this.chatMemo?.lines.length ?? 0;
-		const max = Math.max(0, total - this.lastChatHeight);
-		this.chatScroll = Math.min(max, Math.max(0, this.chatScroll + delta));
+		this.chatScroll = Math.max(0, this.chatScroll + delta);
 		this.follow = this.chatScroll === 0;
+		this.chatMemo = undefined;
 		this.tui.requestRender();
 	}
 
@@ -193,9 +204,19 @@ export class AgentHubComponent {
 			return deficit > 0 ? clipped + " ".repeat(deficit) : clipped;
 		};
 
-		const active = this.rpcInfo.available && this.rpcInfo.totalActive !== undefined ? ` · ${this.rpcInfo.totalActive} active` : "";
-		const rpcBadge = this.rpcInfo.available ? this.theme.fg("success", `rpc ✓${active}`) : dim("rpc –");
-		const title = ` ${this.theme.bold("Agent hub")} ${dim(`· ${this.rows.length} runs ·`)} ${rpcBadge} `;
+		// The two numbers count different populations and must say so. The run
+		// count is the scan of this machine's shared artifact root — every pi
+		// session this user has run. The active count comes from the subagents
+		// bridge, which reports only the session we are inside, foreground
+		// delegations included. Printed side by side without their scopes they
+		// read as a contradiction whenever either is non-zero on its own.
+		const runs = `${this.rows.length} run${this.rows.length === 1 ? "" : "s"} on this machine`;
+		const link = !this.rpcInfo.available
+			? dim("· subagents not answering")
+			: this.rpcInfo.totalActive === undefined
+				? this.theme.fg("success", "· linked")
+				: this.theme.fg("success", `· ${this.rpcInfo.totalActive} active in this session`);
+		const title = ` ${this.theme.bold("Agent hub")} ${dim(`· ${runs} `)}${link} `;
 		const hints = ` ${dim("↑/↓ select · J/K/PgUp/PgDn scroll · G follow · x expand · r rescan · q close")} `;
 
 		const frameRow = (content: string, left: string, right: string): string => {
@@ -244,7 +265,13 @@ export class AgentHubComponent {
 			const name = selected ? this.theme.bold(row.agent) : row.agent;
 			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${name} ${this.theme.fg("dim", `${step}· ${detail}${age ? ` · ${age}` : ""}`)}`, width));
 		}
-		if (this.rows.length === MAX_ROWS) lines.push(this.theme.fg("dim", `showing newest ${MAX_ROWS}`));
+		// Inside the budget, not appended past it: a line beyond `height` is
+		// cropped by the frame and the notice never reaches the reader.
+		if (this.rows.length === MAX_ROWS) {
+			const notice = this.theme.fg("dim", `showing newest ${MAX_ROWS}`);
+			if (lines.length >= height) lines[height - 1] = notice;
+			else lines.push(notice);
+		}
 		return lines;
 	}
 
@@ -252,43 +279,71 @@ export class AgentHubComponent {
 		const row = this.selectedRow();
 		if (!row) return [this.theme.fg("dim", "nothing selected")];
 		const dim = (text: string): string => this.theme.fg("dim", text);
+		const now = Date.now();
 
-		const header = `${this.theme.fg("toolTitle", this.theme.bold(row.agent))} ${dim(`· ${row.state}${row.model ? ` · ${row.model}` : ""} · ${row.runId.slice(0, 8)}`)}`;
+		// The same verdict the list row shows. Interpolating the recorded state
+		// raw claimed "running" for a run whose heartbeat had stopped, one
+		// column away from a row already calling it stale.
+		const state = isStale(row, now) ? "stale" : row.state;
+		const header = `${this.theme.fg("toolTitle", this.theme.bold(row.agent))} ${dim(`· ${state}${row.model ? ` · ${row.model}` : ""} · ${row.runId.slice(0, 8)}`)}`;
+		const viewHeight = Math.max(1, height - 2);
 		const body: string[] = [];
+
 		if (!this.tail) {
 			body.push(dim("this run recorded no session file"));
-			body.push(dim("nothing to read yet"));
+		} else if (!this.tail.fileExists) {
+			body.push(dim("its session file is no longer on disk"));
+			body.push(dim("(retention may have pruned it)"));
 		} else {
 			const memoValid =
 				this.chatMemo !== undefined &&
 				this.chatMemo.width === width &&
+				this.chatMemo.height === viewHeight &&
 				this.chatMemo.expandedTools === this.expandedTools &&
+				this.chatMemo.scroll === this.chatScroll &&
 				this.chatMemo.recordCount === this.tail.records.length &&
 				this.chatMemo.truncatedHead === this.tail.truncatedHead;
 			if (!memoValid) {
+				const built = buildChatWindow(this.tail, width, {
+					tui: this.tui,
+					cwd: row.cwd ?? process.cwd(),
+					expandedTools: this.expandedTools,
+					dim,
+					viewHeight,
+					scroll: this.chatScroll,
+				});
+				// Render owns the clamp: the walk stops at the oldest retained
+				// record, and only it knows where that is.
+				const maxScroll = built.atOldest ? Math.max(0, built.linesKnown - viewHeight) : this.chatScroll;
+				if (this.chatScroll > maxScroll) {
+					this.chatScroll = maxScroll;
+					this.follow = this.chatScroll === 0;
+				}
 				this.chatMemo = {
 					recordCount: this.tail.records.length,
 					truncatedHead: this.tail.truncatedHead,
 					width,
+					height: viewHeight,
 					expandedTools: this.expandedTools,
-					lines: buildChatLines(this.tail, width, {
-						tui: this.tui,
-						cwd: row.cwd ?? process.cwd(),
-						expandedTools: this.expandedTools,
-						dim,
-					}),
+					scroll: this.chatScroll,
+					lines: built.lines,
+					linesKnown: built.linesKnown,
+					atOldest: built.atOldest,
 				};
 			}
-			const all = this.chatMemo!.lines;
-			const viewHeight = height - 2;
-			const maxScroll = Math.max(0, all.length - viewHeight);
-			if (this.follow) this.chatScroll = 0;
-			const scroll = Math.min(this.chatScroll, maxScroll);
-			const end = all.length - scroll;
-			body.push(...all.slice(Math.max(0, end - viewHeight), end));
-			if (scroll > 0) body.push(dim(`↓ ${scroll} newer lines · G to follow`));
+			body.push(...this.chatMemo!.lines);
+			if (this.chatMemo!.lines.length === 0) body.push(dim("no conversation recorded yet"));
 		}
-		return [truncateToWidth(header, width), "", ...body];
+
+		// The pane is exactly `height` lines: header, a blank, then the body.
+		// A notice appended past that budget was cropped by the frame, so the
+		// one state that needed it — scrolled away from the tail — was the one
+		// state that never showed it.
+		const filled = [...body];
+		while (filled.length < viewHeight) filled.push("");
+		const view = filled.slice(0, viewHeight);
+		if (this.chatScroll > 0) view[viewHeight - 1] = truncateToWidth(dim(`↓ ${this.chatScroll} newer lines · G to follow`), width);
+		return [truncateToWidth(header, width), "", ...view];
 	}
 
 	invalidate(): void {
