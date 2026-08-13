@@ -67,7 +67,10 @@ export class SubagentsRpc {
 	 * ownership decides which runs the RPC will act on at all. */
 	sessionId: string | undefined;
 
-	constructor(private readonly events: RpcEvents) {
+	private readonly events: RpcEvents;
+
+	constructor(events: RpcEvents) {
+		this.events = events;
 		this.offReady = events.on(READY_EVENT, raw => {
 			this.manifestSeen = true;
 			this.captureSession(raw);

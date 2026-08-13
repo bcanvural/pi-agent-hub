@@ -120,12 +120,14 @@ export class AgentHubComponent {
 	private liveOutput: OutputTail | undefined;
 	private liveOutputFile: string | undefined;
 
-	constructor(
-		private readonly tui: TUI,
-		private readonly theme: Theme,
-		events: RpcEvents,
-		private readonly done: (result: undefined) => void,
-	) {
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly done: (result: undefined) => void;
+
+	constructor(tui: TUI, theme: Theme, events: RpcEvents, done: (result: undefined) => void) {
+		this.tui = tui;
+		this.theme = theme;
+		this.done = done;
 		this.rpc = new SubagentsRpc(events);
 		this.refreshRuns();
 		if (this.rows.length > 0) this.select(rowKey(this.rows[0]!));
