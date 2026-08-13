@@ -387,9 +387,11 @@ interface MachineReport {
 	body: string;
 }
 
-/** Split machine-report fences out of an assistant message, returning a copy
- * with the fences removed and the reports to render separately. The original
- * message is never mutated — it is the session record itself. */
+/** Split machine-report fences out of a message, returning a copy with the
+ * fences removed and the reports to render separately. The original message
+ * is never mutated — it is the session record itself. Applies to user
+ * messages too: the task prompt quotes the report SHAPE at the child, and a
+ * 40-line placeholder JSON wall reads no better for being a quotation. */
 function extractMachineReports(message: NonNullable<SessionRecord["message"]>): { prose: NonNullable<SessionRecord["message"]>; reports: MachineReport[] } {
 	if (!Array.isArray(message.content)) return { prose: message, reports: [] };
 	const reports: MachineReport[] = [];
@@ -417,30 +419,13 @@ function extractMachineReports(message: NonNullable<SessionRecord["message"]>): 
 	return { prose: { ...message, content }, reports };
 }
 
-function renderRecord(
-	record: SessionRecord,
-	resultsByCallId: ResultsById,
+function pushReportBoxes(
+	reports: MachineReport[],
+	lines: string[],
 	width: number,
 	options: ChatRenderOptions,
 	expanded: boolean,
-): string[] {
-	const message = record.message;
-	if (!message) return [];
-	const markdownTheme = getMarkdownTheme();
-	const lines: string[] = [];
-
-	if (message.role === "user") {
-		const text = textOfBlocks(message.content);
-		if (text.trim()) lines.push(...new UserMessageComponent(text, markdownTheme).render(width));
-		return lines;
-	}
-	if (message.role !== "assistant") return lines;
-
-	// Guard before constructing, not after: the component reads `content`
-	// eagerly and throws on a shape it does not expect.
-	if (!Array.isArray(message.content)) return lines;
-	const { prose, reports } = extractMachineReports(message);
-	lines.push(...new AssistantMessageComponent(prose as never, false, markdownTheme).render(width));
+): void {
 	for (const report of reports) {
 		// A real tool component, so the report wears the same box every other
 		// piece of machine output wears — and inherits whatever treatment the
@@ -461,6 +446,35 @@ function renderRecord(
 		component.setExpanded(expanded);
 		lines.push(...capToolLines(component.render(width), expanded, width, options.dim));
 	}
+}
+
+function renderRecord(
+	record: SessionRecord,
+	resultsByCallId: ResultsById,
+	width: number,
+	options: ChatRenderOptions,
+	expanded: boolean,
+): string[] {
+	const message = record.message;
+	if (!message) return [];
+	const markdownTheme = getMarkdownTheme();
+	const lines: string[] = [];
+
+	if (message.role === "user") {
+		const { prose, reports } = extractMachineReports(message);
+		const text = textOfBlocks(prose.content);
+		if (text.trim()) lines.push(...new UserMessageComponent(text, markdownTheme).render(width));
+		pushReportBoxes(reports, lines, width, options, expanded);
+		return lines;
+	}
+	if (message.role !== "assistant") return lines;
+
+	// Guard before constructing, not after: the component reads `content`
+	// eagerly and throws on a shape it does not expect.
+	if (!Array.isArray(message.content)) return lines;
+	const { prose, reports } = extractMachineReports(message);
+	lines.push(...new AssistantMessageComponent(prose as never, false, markdownTheme).render(width));
+	pushReportBoxes(reports, lines, width, options, expanded);
 
 	for (const block of message.content) {
 		if (typeof block !== "object" || block === null) continue;

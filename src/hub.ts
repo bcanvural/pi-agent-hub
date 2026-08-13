@@ -723,10 +723,12 @@ export class AgentHubComponent {
 		}
 		if (data === "K") return this.scrollChat(1);
 		if (data === "J") return this.scrollChat(-1);
-		// Half-page vim motions. Ctrl+U is safe here: compose and search handle
-		// their own input before nav dispatch, so clear-line keeps working there.
-		if (data === "\x15") return this.scrollChat(Math.max(1, Math.floor(this.lastPaneHeight / 2)));
-		if (data === "\x04") return this.scrollChat(-Math.max(1, Math.floor(this.lastPaneHeight / 2)));
+		// Half-page vim motions on plain u/d: pi-tui's editor owns ctrl+u
+		// ("delete to line start") and ctrl+d at a layer above overlays, so the
+		// ctrl forms never arrive — kept below as aliases for terminals where
+		// they do. Plain printables in nav mode are entirely ours.
+		if (data === "u" || data === "\x15") return this.scrollChat(Math.max(1, Math.floor(this.lastPaneHeight / 2)));
+		if (data === "d" || data === "\x04") return this.scrollChat(-Math.max(1, Math.floor(this.lastPaneHeight / 2)));
 		if (data === "\x1b[5~") return this.scrollChat(this.lastPaneHeight);
 		if (data === "\x1b[6~") return this.scrollChat(-this.lastPaneHeight);
 		if (data === "g") {
@@ -1054,7 +1056,7 @@ export class AgentHubComponent {
 		if (this.mode === "compose") return "enter send · esc cancel · ctrl+u clear";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
-		return "↑/↓ select · J/K·^U/^D scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
+		return "↑/↓ select · J/K·u/d scroll · g/G top/tail · t tool · x expand · s message · i interrupt · D stop · / find · q close";
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest

@@ -44,7 +44,7 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 |---|---|
 | `↑`/`↓` or `k`/`j` | select a run |
 | `J`/`K`, `PgUp`/`PgDn` | scroll the conversation |
-| `ctrl+u`/`ctrl+d` | half-page up / down |
+| `u`/`d` | half-page up / down |
 | `g` / `G` | jump to the oldest retained record / back to the live tail |
 | `s` / `enter` | message the run — steers it live, or resumes a finished one |
 | `i` | interrupt (graceful, resumable) |
