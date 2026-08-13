@@ -957,7 +957,14 @@ export class AgentHubComponent {
 		// ~78% of the terminal: pi centers the overlay on the component's own
 		// height, and a panel that claims almost everything reads as glued to
 		// the top — the margins have to be visible for "floating" to be true.
-		const height = Math.max(16, Math.min(Math.floor(terminalRows * 0.78), terminalRows - 6));
+		//
+		// The floor is itself capped by what the overlay will show: pi clips a
+		// too-tall component bottom-first (maxHeight "85%", margin 1 — keep in
+		// step with index.ts), and the bottom of this layout is the hints, the
+		// border, and then the composer. A floor above the clip made a 16-row
+		// terminal render a composer nobody could see: type blind, send blind.
+		const overlayCeiling = Math.min(Math.floor(terminalRows * 0.85), terminalRows - 2);
+		const height = Math.min(overlayCeiling, Math.max(16, Math.min(Math.floor(terminalRows * 0.78), terminalRows - 6)));
 		// The panel draws its own frame — the overlay paints no border of its
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
@@ -982,7 +989,13 @@ export class AgentHubComponent {
 		// subagents bridge, which reports only the session we are inside,
 		// foreground delegations included.
 		const running = this.rows.filter(row => row.state === "running" && !isStale(row, now)).length;
-		const sessionTokens = this.rpcInfo.entries.reduce((sum, entry) => sum + (entry.tokens?.total ?? 0), 0);
+		// Foreign numbers deserve the same suspicion as foreign strings: a
+		// string total concatenates instead of adding, Infinity renders as
+		// "InfinityK tok".
+		const sessionTokens = this.rpcInfo.entries.reduce((sum, entry) => {
+			const total = entry.tokens?.total;
+			return typeof total === "number" && Number.isFinite(total) && total > 0 ? sum + total : sum;
+		}, 0);
 		const statsParts = [
 			running > 0 ? this.theme.fg("warning", `⟳ ${running} running`) : dim("nothing running"),
 			dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} on this machine`),
@@ -1156,7 +1169,9 @@ export class AgentHubComponent {
 		// height is cropped and the notice never reaches the reader.
 		if (capped) {
 			while (lines.length < height) lines.push("");
-			lines.push(dim(`showing newest ${MAX_ROWS} · r to rescan`));
+			// Key first: at narrow panes the tail is what truncation eats, and
+			// the recovery key is the half the notice exists to advertise.
+			lines.push(dim(`r rescans · newest ${MAX_ROWS} shown`));
 		}
 		return lines;
 	}
