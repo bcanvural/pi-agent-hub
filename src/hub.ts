@@ -68,7 +68,23 @@ function formatAge(from: number | undefined, now: number): string {
 const EDIT_OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const EDIT_CSI = /\x1b\[[0-9;:<=>?]*[ -\/]*[@-~]/g;
 const EDIT_SS3 = /\x1bO./g;
+/** DCS, SOS, PM and APC: `ESC P|X|^|_ … ST`. Their payloads are terminal
+ * responses (kitty graphics acks, DECRQSS), never typed text — stripping just
+ * the introducer left `Gi=1;OK` in a message. */
+const EDIT_DCS_LIKE = /\x1b[PX^_][^\x1b]*\x1b\\/g;
+/** The same strings in their single-byte C1 forms, plus C1 CSI and OSC. The
+ * generic control strip removes the C1 byte itself but would leave the
+ * payload behind as text. */
+const EDIT_C1_STRING = /[\u0090\u0098\u009e\u009f\u009d][^\u009c\u0007\u001b]*(?:\u009c|\u0007|\x1b\\)/g;
+const EDIT_C1_CSI = /\u009b[0-9;:<=>?]*[ -\/]*[@-~]/g;
 const EDIT_OTHER = /\x1b./g;
+
+/** Longest partial escape sequence held between reads. Split paste markers
+ * and split arrows fit in a few bytes; anything growing past this is an
+ * unterminated string sequence swallowing keystrokes — an OSC introducer at
+ * a paste boundary froze the composer while the carry ate 20,000 characters.
+ * Sequence payloads are never message text, so the overflow is dropped. */
+const EDIT_CARRY_MAX = 16;
 
 /** Keystrokes and pastes, reduced to what a single-line composer accepts.
  *
@@ -81,6 +97,9 @@ const EDIT_OTHER = /\x1b./g;
 function composerText(data: string): string {
 	return data
 		.replace(EDIT_OSC, "")
+		.replace(EDIT_DCS_LIKE, "")
+		.replace(EDIT_C1_STRING, "")
+		.replace(EDIT_C1_CSI, "")
 		.replace(EDIT_CSI, "")
 		.replace(EDIT_SS3, "")
 		.replace(EDIT_OTHER, "")
@@ -96,7 +115,9 @@ function incompleteEscape(tail: string): boolean {
 	if (tail === "\x1b") return true;
 	const kind = tail[1];
 	if (kind === "[") return !/[@-~]/.test(tail.slice(2));
-	if (kind === "]") return !(tail.includes("\x07") || tail.includes("\x1b\\"));
+	if (kind === "]" || kind === "P" || kind === "X" || kind === "^" || kind === "_") {
+		return !(tail.includes("\x07") || tail.includes("\x1b\\"));
+	}
 	if (kind === "O") return tail.length < 3;
 	return false;
 }
@@ -108,6 +129,9 @@ function capText(text: string, max: number): string {
 	let capped = text.length > max ? text.slice(0, max) : text;
 	const last = capped.charCodeAt(capped.length - 1);
 	if (last >= 0xd800 && last <= 0xdbff) capped = capped.slice(0, -1);
+	// A cap landing after a zero-width joiner leaves it dangling, waiting to
+	// fuse with whatever the receiving side prints next.
+	if (capped.charCodeAt(capped.length - 1) === 0x200d) capped = capped.slice(0, -1);
 	return capped;
 }
 
@@ -155,7 +179,10 @@ export class AgentHubComponent {
 	 * front, and an index would silently drift onto a different record. */
 	private searchMatches: object[] = [];
 	private searchCursor = -1;
-	private notice: Notice | undefined;
+	/** Latest notice per run (plus one global slot). A single shared slot meant
+	 * a background run's ack either overwrote the visible notice (before the
+	 * runKey gate) or blanked the row by evicting it (after). */
+	private readonly notices = new Map<string, Notice>();
 	private ackWatch: AckWatch | undefined;
 	/** One control action in flight at a time; Enter with nothing visibly
 	 * happening invited re-sends, and each re-send steered the child again. */
@@ -232,10 +259,15 @@ export class AgentHubComponent {
 		}
 		this.pollLiveOutput();
 		this.pollAck();
-		if (this.notice && Date.now() - this.notice.at > (this.notice.tone === "error" ? 10_000 : 6000)) {
-			this.notice = undefined;
-			this.tui.requestRender();
+		const now = Date.now();
+		let pruned = false;
+		for (const [key, notice] of this.notices) {
+			if (now - notice.at > this.noticeTtl(notice)) {
+				this.notices.delete(key);
+				pruned = true;
+			}
 		}
+		if (pruned) this.tui.requestRender();
 	}
 
 	/** The output log streams while the session file waits for the tool to
@@ -269,7 +301,8 @@ export class AgentHubComponent {
 			// `queued` is a waypoint, not an outcome — keep watching for the
 			// delivered/failed transition instead of declaring victory early.
 			if (ack.state === "queued") {
-				if (this.notice?.runKey !== runKey || !this.notice.text.includes("queued")) {
+				const existing = this.notices.get(runKey);
+				if (!existing || !existing.text.includes("queued")) {
 					this.setNotice(`${agent}: queued — delivers between turns`, "info", runKey);
 				}
 			} else {
@@ -313,8 +346,22 @@ export class AgentHubComponent {
 	private setNotice(text: string, tone: Notice["tone"], runKey?: string): void {
 		// Foreign text reaches this — bridge reply wording, agent names — and a
 		// control byte in a notice is a control byte in a rendered row.
-		this.notice = { text: sanitizeLine(text), tone, at: Date.now(), ...(runKey !== undefined ? { runKey } : {}) };
+		this.notices.set(runKey ?? "", { text: sanitizeLine(text), tone, at: Date.now(), ...(runKey !== undefined ? { runKey } : {}) });
 		this.tui.requestRender();
+	}
+
+	private noticeTtl(notice: Notice): number {
+		return notice.tone === "error" ? 10_000 : 6000;
+	}
+
+	/** The notice the action row shows: the selected run's, else the global
+	 * one. Fresh entries only; expiry is pruned on the poll tick. */
+	private visibleNotice(now: number): Notice | undefined {
+		for (const key of [this.selectedKey ?? "", ""]) {
+			const notice = this.notices.get(key);
+			if (notice && now - notice.at <= this.noticeTtl(notice)) return notice;
+		}
+		return undefined;
 	}
 
 	// ── actions ─────────────────────────────────────────────────────────────
@@ -336,17 +383,23 @@ export class AgentHubComponent {
 		return row.state === "running" && !isStale(row, now) ? "steer" : "resume";
 	}
 
-	private async sendMessage(row: RunRow, text: string): Promise<void> {
+	/** Synchronous acceptance check: true means the message is on its way and
+	 * the composer may clear. Refusing AFTER the composer cleared destroyed
+	 * whatever the user had typed. */
+	private trySend(row: RunRow, text: string): boolean {
 		if (this.actionBusy) {
-			this.setNotice("still sending the previous action…", "info", rowKey(row));
-			return;
+			this.setNotice("still sending the previous action — your text is kept", "info", rowKey(row));
+			return false;
 		}
 		this.actionBusy = true;
-		try {
-			await this.sendMessageInner(row, text);
-		} finally {
-			this.actionBusy = false;
-		}
+		void (async () => {
+			try {
+				await this.sendMessageInner(row, text);
+			} finally {
+				this.actionBusy = false;
+			}
+		})();
+		return true;
 	}
 
 	private async sendMessageInner(row: RunRow, text: string): Promise<void> {
@@ -424,6 +477,20 @@ export class AgentHubComponent {
 			this.setNotice("nothing to interrupt — this run is not live", "error", key);
 			return;
 		}
+		if (this.actionBusy) {
+			this.setNotice("still sending the previous action…", "info", key);
+			return;
+		}
+		this.actionBusy = true;
+		this.setNotice(`interrupting ${sanitizeLine(row.agent)}…`, "info", key);
+		try {
+			await this.interruptInner(row, key);
+		} finally {
+			this.actionBusy = false;
+		}
+	}
+
+	private async interruptInner(row: RunRow, key: string): Promise<void> {
 		if (this.ownsRun(row) === false) {
 			this.fileControlRequest(row, "interrupt");
 			return;
@@ -432,7 +499,7 @@ export class AgentHubComponent {
 		if (this.disposed) return;
 		if (outcome.ok) this.setNotice(outcome.text || "interrupt requested", "success", key);
 		else if (outcome.unreachable) this.fileControlRequest(row, "interrupt");
-		else this.setNotice(outcome.text, "error", key);
+		else this.setNotice(outcome.text || "interrupt rejected", "error", key);
 	}
 
 	/** The file-inbox fallback for interrupt/stop, with the same honesty gates
@@ -458,6 +525,20 @@ export class AgentHubComponent {
 
 	private async stopRun(row: RunRow): Promise<void> {
 		const key = rowKey(row);
+		if (this.actionBusy) {
+			this.setNotice("still sending the previous action…", "info", key);
+			return;
+		}
+		this.actionBusy = true;
+		this.setNotice(`stopping ${sanitizeLine(row.agent)}…`, "info", key);
+		try {
+			await this.stopInner(row, key);
+		} finally {
+			this.actionBusy = false;
+		}
+	}
+
+	private async stopInner(row: RunRow, key: string): Promise<void> {
 		if (this.ownsRun(row) === false) {
 			this.fileControlRequest(row, "stop");
 			return;
@@ -468,7 +549,7 @@ export class AgentHubComponent {
 			this.setNotice(outcome.text || "stop requested", "success", key);
 			this.refreshRuns();
 		} else if (outcome.unreachable) this.fileControlRequest(row, "stop");
-		else this.setNotice(outcome.text, "error", key);
+		else this.setNotice(outcome.text || "stop rejected", "error", key);
 	}
 
 	/** Open the child's cwd / copy its session path. User-invoked one-shots;
@@ -498,16 +579,20 @@ export class AgentHubComponent {
 		const args = process.platform === "darwin" ? [] : ["-selection", "clipboard"];
 		try {
 			const proc = child_process.spawn(tool, args, { stdio: ["pipe", "ignore", "ignore"] });
+			let failed = false;
 			proc.on("error", () => {
+				failed = true;
 				if (!this.disposed) this.setNotice(`copy failed (${tool} not available)`, "error");
 			});
-			// Claimed only once it happened: the success notice used to appear
-			// before the tool had run, then correct itself to a failure.
-			proc.on("close", code => {
-				if (!this.disposed && code === 0) this.setNotice("session path copied", "success");
-			});
+			// Success is claimed when the path has been handed over, not before:
+			// pbcopy exits (close fires), but xclip forks to own the selection
+			// and never closes — gating on close left Linux permanently silent.
 			proc.stdin.on("error", () => {});
-			proc.stdin.end(row.sessionFile);
+			proc.stdin.end(row.sessionFile, () => {
+				setTimeout(() => {
+					if (!this.disposed && !failed) this.setNotice("session path copied", "success");
+				}, 60);
+			});
 		} catch (error) {
 			this.setNotice(`copy failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
@@ -682,6 +767,12 @@ export class AgentHubComponent {
 
 	private handleEditingInput(data: string): void {
 		const composing = this.mode === "compose";
+		// Deliberate: a bare ESC cancels even though it could be the head of an
+		// arrow split across reads — cancel is what a person pressing ESC means,
+		// and the orphaned tail lands in nav mode where it matches no binding.
+		// The same ambiguity makes a stranded `ESC [` carry eat exactly one
+		// typed character (its final byte); one character, once, with no way to
+		// tell an arrow's final from a keystroke at this layer.
 		if (data === "\x1b" || data === "\x03") {
 			this.mode = "nav";
 			this.editCarry = "";
@@ -693,9 +784,14 @@ export class AgentHubComponent {
 			if (composing) {
 				const row = this.selectedRow();
 				const text = this.composer.trim();
-				this.mode = "nav";
-				this.composer = "";
-				if (row && text) void this.sendMessage(row, text);
+				if (!row || !text) {
+					this.mode = "nav";
+					this.composer = "";
+				} else if (this.trySend(row, text)) {
+					this.mode = "nav";
+					this.composer = "";
+				}
+				// Refused: stay in compose with the text intact.
 			} else {
 				this.mode = "nav";
 				this.runSearch(this.searchInput.trim());
@@ -704,12 +800,14 @@ export class AgentHubComponent {
 			return;
 		}
 		if (data === "\x7f" || data === "\x08") {
+			this.editCarry = "";
 			if (composing) this.composer = [...this.composer].slice(0, -1).join("");
 			else this.searchInput = [...this.searchInput].slice(0, -1).join("");
 			this.tui.requestRender();
 			return;
 		}
 		if (data === "\x15") {
+			this.editCarry = "";
 			if (composing) this.composer = "";
 			else this.searchInput = "";
 			this.tui.requestRender();
@@ -719,9 +817,14 @@ export class AgentHubComponent {
 		this.editCarry = "";
 		// Hold back an escape sequence still being delivered — the paste
 		// markers themselves split across reads — rather than mangle its halves.
+		// Bounded: a stranded string introducer (an OSC cut at a read boundary)
+		// otherwise swallows every keystroke after it, silently and forever.
+		// Past the bound the carry is junk terminal chatter, not typing, and is
+		// dropped whole — sequence payloads are never message text.
 		const lastEscape = combined.lastIndexOf("\x1b");
 		if (lastEscape !== -1 && incompleteEscape(combined.slice(lastEscape))) {
-			this.editCarry = combined.slice(lastEscape);
+			const held = combined.slice(lastEscape);
+			this.editCarry = held.length > EDIT_CARRY_MAX ? "" : held;
 			combined = combined.slice(0, lastEscape);
 		}
 		const text = composerText(combined);
@@ -866,9 +969,10 @@ export class AgentHubComponent {
 		if (this.mode === "confirmStop") {
 			return this.theme.fg("error", `⚠ stop ${sanitizeLine(row?.agent ?? "this run")} (${sanitizeLine(row?.runId ?? "?").slice(0, 8)})? press D again to confirm`);
 		}
-		if (this.notice && (this.notice.runKey === undefined || this.notice.runKey === this.selectedKey)) {
-			const tone = this.notice.tone === "error" ? "error" : this.notice.tone === "success" ? "success" : "dim";
-			return this.theme.fg(tone, this.notice.text);
+		const notice = this.visibleNotice(now);
+		if (notice) {
+			const tone = notice.tone === "error" ? "error" : notice.tone === "success" ? "success" : "dim";
+			return this.theme.fg(tone, notice.text);
 		}
 		if (this.focusedRecord) {
 			const name = sanitizeLine(firstToolName(this.focusedRecord) ?? "tools");
@@ -949,7 +1053,9 @@ export class AgentHubComponent {
 	private chatOptions() {
 		return {
 			tui: this.tui,
-			cwd: this.selectedRow()?.cwd ?? process.cwd(),
+			// Sanitized like every other status.json string: the components build
+			// OSC-8 file links from it, and a real path is unchanged by the strip.
+			cwd: sanitizeLine(this.selectedRow()?.cwd ?? process.cwd()),
 			expandedTools: this.expandedTools,
 			expandedFor: (record: object) => this.expandOverrides.get(record) ?? this.expandedTools,
 			dim: (text: string): string => this.theme.fg("dim", text),
@@ -1050,7 +1156,7 @@ export class AgentHubComponent {
 		const view = filled.slice(0, viewHeight);
 		if (this.chatScroll > 0) view.push(truncateToWidth(dim(`↓ ${this.chatScroll} newer lines · G to follow`), width));
 		if (liveLines.length > 0) {
-			view.push(truncateToWidth(dim(`┈ live output (${path.basename(this.liveOutputFile ?? "output")})`), width));
+			view.push(truncateToWidth(dim(`┈ live output (${sanitizeLine(path.basename(this.liveOutputFile ?? "output"))})`), width));
 			for (const line of liveLines) view.push(truncateToWidth(dim(line), width));
 		}
 		while (view.length < paneHeight) view.push("");

@@ -92,13 +92,17 @@ export class SubagentsRpc {
 	}
 
 	/** One ping to learn the session id when the ready broadcast predates us.
-	 * Bounded: a bridge that answers without a session (no UI context yet)
-	 * would otherwise be re-pinged every refresh tick forever. */
+	 * Bounded on ANSWERS that carried no session — a bridge with no UI context
+	 * yet would otherwise be re-pinged every refresh tick forever. Timeouts do
+	 * not spend the budget: a bridge that was busy at startup can still be
+	 * identified once it starts answering. */
 	async identify(): Promise<void> {
 		if (this.sessionId !== undefined || this.identifyAttempts >= 3) return;
-		this.identifyAttempts++;
 		const reply = await this.call("ping", undefined, 3000);
-		if (reply?.success) this.captureSession(reply.data);
+		if (reply?.success) {
+			this.captureSession(reply.data);
+			if (this.sessionId === undefined) this.identifyAttempts++;
+		}
 	}
 
 	/** Whether the bridge has announced itself this process — a hint, not a
