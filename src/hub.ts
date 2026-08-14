@@ -7,11 +7,11 @@ import * as child_process from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-/** What the roster shows. Project is the default — "the agents of this work"
- * is the usual question; the machine-wide view is the hub's superpower and
- * stays one keypress away; session matches the stock inspector's scope. */
+/** What the roster shows. Session is the default — the agents THIS
+ * conversation launched; f widens to the project, then the whole machine,
+ * the hub's superpower the stock inspector lacks. */
 type Scope = "project" | "session" | "machine";
-const SCOPE_ORDER: Scope[] = ["project", "session", "machine"];
+const SCOPE_ORDER: Scope[] = ["session", "project", "machine"];
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { findAck, readCapability, runnerReachable, steerInboxClosed, writeControlRequest, writeSteerRequestFile } from "./control-files.ts";
@@ -163,7 +163,7 @@ function capText(text: string, max: number): string {
 
 export class AgentHubComponent {
 	private rows: RunRow[] = [];
-	private scope: Scope = "project";
+	private scope: Scope = "session";
 	private readonly projectRoot = path.resolve(process.cwd());
 	private readonly scanCache: ScanCache = new Map();
 	private selectedKey: string | undefined;
@@ -274,10 +274,18 @@ export class AgentHubComponent {
 	private async refreshRpc(): Promise<void> {
 		const fleet = await this.rpc.fleet();
 		if (this.disposed) return;
+		const hadIdentity = this.rpc.sessionId !== undefined;
 		if (fleet.available) await this.rpc.identify();
 		if (this.disposed) return;
 		const changed = fleet.available !== this.rpcInfo.available || fleet.totalActive !== this.rpcInfo.totalActive;
 		this.rpcInfo = fleet;
+		// Session identity arriving is what makes the session scope filterable —
+		// re-filter immediately rather than leaving the default view empty
+		// until the next scan tick.
+		if (!hadIdentity && this.rpc.sessionId !== undefined) {
+			this.lastSignature = "";
+			this.refreshRuns();
+		}
 		if (changed) this.tui.requestRender();
 	}
 

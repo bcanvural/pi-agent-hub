@@ -29,9 +29,9 @@ those components.
 Runs are discovered by scanning pi-subagents' artifact root — the only place
 that records a run's id and its child's session file. Its versioned
 cross-extension RPC (`subagents:rpc:v1:*` on pi's event bus) supplies the
-liveness badge alongside. The roster opens scoped to **this project** (runs
-whose recorded cwd is the directory pi runs in); `f` widens to the whole
-machine or narrows to this session. The strip names the scope in force.
+liveness badge alongside. The roster opens scoped to **this session** — the agents this conversation
+launched; `f` widens to the project (runs whose recorded cwd is the directory
+pi runs in), then the whole machine. The strip names the scope in force.
 
 ## Use
 
@@ -54,7 +54,7 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 | `/`, then `n`/`N` | search the conversation and walk the matches |
 | `o` | open the child's working directory |
 | `y` | copy the session file path |
-| `f` | cycle scope: project → session → machine |
+| `f` | cycle scope: session → project → machine |
 | `r` | rescan runs |
 | `q` / `esc` | back to your conversation |
 
