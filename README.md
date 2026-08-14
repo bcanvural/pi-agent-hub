@@ -41,7 +41,11 @@ pi runs in), then the whole machine. The strip names the scope in force.
 pi install /path/to/pi-agent-hub        # or -l for one project
 ```
 
-`/hub` — or `alt+a`, the omp reflex — opens the panel.
+`/hub` — or `alt+a`, the omp reflex — opens the panel. Each run shows what it
+cost: pi prices every assistant turn into the child's session file, and the
+hub sums those records — filled in gradually after opening, `…` while a sum
+is still counting, and per conversation (a child's own spend, not its
+grandchildren's).
 
 | key | action |
 |---|---|

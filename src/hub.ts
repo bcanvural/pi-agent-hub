@@ -16,6 +16,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { findAck, readCapability, runnerReachable, steerInboxClosed, writeControlRequest, writeSteerRequestFile } from "./control-files.ts";
 import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts";
+import { formatCost, formatTokens, UsageMeter } from "./usage.ts";
 import { asyncRunsRoot, isStale, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
 import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail } from "./session-view.ts";
@@ -211,6 +212,9 @@ export class AgentHubComponent {
 	private editDiscard: { kind: "st" | "csi"; pendingEsc: boolean; spent: number } | undefined;
 	private liveOutput: OutputTail | undefined;
 	private liveOutputFile: string | undefined;
+	/** One meter per session file. Bounded and pruned; completed runs cost one
+	 * stat per occasional check after they converge. */
+	private readonly meters = new Map<string, UsageMeter>();
 
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -310,6 +314,7 @@ export class AgentHubComponent {
 			this.tui.requestRender();
 		}
 		this.pollLiveOutput();
+		this.advanceUsage();
 		this.pollAck();
 		const now = Date.now();
 		let pruned = false;
@@ -320,6 +325,44 @@ export class AgentHubComponent {
 			}
 		}
 		if (pruned) this.tui.requestRender();
+	}
+
+	/** One meter advances per tick, selected run first: the cold fill of a
+	 * roster of multi-megabyte sessions spreads across ticks instead of
+	 * stalling the event loop, and converged meters cost a stat. */
+	private advanceUsage(): void {
+		const candidates: string[] = [];
+		const selected = this.selectedRow();
+		if (selected?.sessionFile) candidates.push(selected.sessionFile);
+		for (const row of this.rows) {
+			if (row.sessionFile && !candidates.includes(row.sessionFile)) candidates.push(row.sessionFile);
+		}
+		if (this.meters.size > 300) {
+			const keep = new Set(candidates);
+			for (const key of this.meters.keys()) {
+				if (!keep.has(key)) this.meters.delete(key);
+				if (this.meters.size <= 300) break;
+			}
+		}
+		// The selected meter always gets a look (its run may be growing); after
+		// it, the first meter that has not yet converged.
+		let advanced = false;
+		for (const [index, file] of candidates.entries()) {
+			let meter = this.meters.get(file);
+			if (!meter) {
+				meter = new UsageMeter(file);
+				this.meters.set(file, meter);
+			}
+			if (index === 0 || !meter.done) {
+				if (meter.advance()) advanced = true;
+				if (!meter.done || index > 0) break;
+			}
+		}
+		if (advanced) this.tui.requestRender();
+	}
+
+	private usageFor(file: string | undefined): UsageMeter | undefined {
+		return file ? this.meters.get(file) : undefined;
 	}
 
 	/** The output log streams while the session file waits for the tool to
@@ -1032,6 +1075,13 @@ export class AgentHubComponent {
 		// active count, a visible self-contradiction.
 		const sessionUnknown = this.scope === "session" && this.rpc.sessionId === undefined;
 		const scopeLabel = this.scope === "machine" ? "on this machine" : this.scope === "project" ? "in this project" : "in this session";
+		let scopeCost = 0;
+		let scopeCostComplete = this.rows.length > 0;
+		for (const row of this.rows) {
+			const meter = this.usageFor(row.sessionFile);
+			if (meter) scopeCost += meter.totals.cost;
+			if (!meter?.done) scopeCostComplete = false;
+		}
 		const statsParts = [
 			sessionUnknown
 				? dim("session not identified yet")
@@ -1039,6 +1089,7 @@ export class AgentHubComponent {
 					? this.theme.fg("warning", `⟳ ${running} running`)
 					: dim("No agents running"),
 			sessionUnknown ? dim("r retries · f scope") : dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} ${scopeLabel} · f scope`),
+			...(!sessionUnknown && scopeCost > 0 ? [dim(`${formatCost(scopeCost)}${scopeCostComplete ? "" : "…"}`)] : []),
 			!this.rpcInfo.available
 				? dim("subagents not answering")
 				: this.rpcInfo.totalActive === undefined
@@ -1201,8 +1252,13 @@ export class AgentHubComponent {
 			const detail = sanitizeLine(stale ? "stale" : row.state === "running" ? (row.currentTool ?? "…") : row.state);
 			const step = row.stepCount > 1 ? `#${row.stepIndex} · ` : "";
 			const active = row.startedAt !== undefined ? formatDuration((row.lastActivityAt ?? row.lastUpdate ?? row.startedAt) - row.startedAt) : "";
+			const meter = this.usageFor(row.sessionFile);
+			const cost = meter && (meter.done || meter.totals.cost > 0)
+				? `${formatCost(meter.totals.cost)}${meter.done ? "" : "…"}`
+				: row.sessionFileExists ? "$…" : undefined;
 			const statsParts = [
 				`${step}${detail}`,
+				...(cost ? [cost] : []),
 				...(active ? [`${active} active`] : []),
 				...(row.turnCount !== undefined ? [`${row.turnCount} req`] : []),
 				...(row.toolCount !== undefined ? [`${row.toolCount} tools`] : []),
@@ -1258,7 +1314,11 @@ export class AgentHubComponent {
 		// column away from a row already calling it stale.
 		const stale = isStale(row, now);
 		const state = sanitizeLine(stale ? "stale" : row.state);
-		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${row.model ? ` · ${sanitizeLine(row.model)}` : ""} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
+		const meter = this.usageFor(row.sessionFile);
+		const usage = meter && (meter.done || meter.totals.cost > 0)
+			? ` · ${formatCost(meter.totals.cost)}${meter.done ? "" : "…"} · ${formatTokens(meter.totals.tokens)} tok`
+			: "";
+		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${row.model ? ` · ${sanitizeLine(row.model)}` : ""}${usage} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
 		const paneHeight = Math.max(1, height - 2);
 		this.lastPaneHeight = paneHeight;
 		// One row is reserved for the scroll indicator, and a block for the live
