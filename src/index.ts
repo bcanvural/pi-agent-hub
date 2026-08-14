@@ -17,7 +17,7 @@ export default function agentHubExtension(pi: ExtensionAPI): void {
 		open = true;
 		try {
 			await ctx.ui.custom<undefined>(
-				(tui, theme, _keybindings, done) => new AgentHubComponent(tui, theme, pi.events as unknown as RpcEvents, done),
+				(tui, theme, _keybindings, done) => new AgentHubComponent(tui, theme, pi.events as unknown as RpcEvents, done, ctx.cwd),
 				{
 					overlay: true,
 					overlayOptions: { anchor: "center", width: "92%", minWidth: 70, maxHeight: "85%", margin: 1 },

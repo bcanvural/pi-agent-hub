@@ -263,8 +263,8 @@ function textOfBlocks(content: unknown): string {
 		.join("\n");
 }
 
-/** Whether an assistant record carries tool calls — the groups the per-tool
- * expand toggle and the focus stepper act on. */
+/** Whether a record renders any tool box — retained (with the group spans)
+ * for a future visible per-tool focus; nothing in the hub consumes it today. */
 export function hasToolCalls(record: object): boolean {
 	const content = (record as SessionRecord).message?.content;
 	if (!Array.isArray(content)) return false;

@@ -164,7 +164,7 @@ function capText(text: string, max: number): string {
 export class AgentHubComponent {
 	private rows: RunRow[] = [];
 	private scope: Scope = "session";
-	private readonly projectRoot = path.resolve(process.cwd());
+	private readonly projectRoot: string;
 	private readonly scanCache: ScanCache = new Map();
 	private selectedKey: string | undefined;
 	private listWindowTop = 0;
@@ -216,10 +216,15 @@ export class AgentHubComponent {
 	private readonly theme: Theme;
 	private readonly done: (result: undefined) => void;
 
-	constructor(tui: TUI, theme: Theme, events: RpcEvents, done: (result: undefined) => void) {
+	constructor(tui: TUI, theme: Theme, events: RpcEvents, done: (result: undefined) => void, projectRoot?: string) {
 		this.tui = tui;
 		this.theme = theme;
 		this.done = done;
+		// pi's session cwd, not the launch dir: `pi --resume` adopts the
+		// session's directory while process.cwd() stays where pi was started,
+		// and runs record the session cwd — comparing against the wrong one
+		// made project scope silently empty after a cross-directory resume.
+		this.projectRoot = path.resolve(projectRoot ?? process.cwd());
 		this.rpc = new SubagentsRpc(events);
 		this.refreshRuns();
 		if (this.rows.length > 0) this.select(rowKey(this.rows[0]!));
@@ -272,9 +277,13 @@ export class AgentHubComponent {
 	}
 
 	private async refreshRpc(): Promise<void> {
+		// Captured before any await: the bridge's ready broadcast can land
+		// during the fleet round trip, and reading afterwards made the
+		// undefined→defined transition invisible — the default session view
+		// then sat empty until the next scan tick.
+		const hadIdentity = this.rpc.sessionId !== undefined;
 		const fleet = await this.rpc.fleet();
 		if (this.disposed) return;
-		const hadIdentity = this.rpc.sessionId !== undefined;
 		if (fleet.available) await this.rpc.identify();
 		if (this.disposed) return;
 		const changed = fleet.available !== this.rpcInfo.available || fleet.totalActive !== this.rpcInfo.totalActive;
@@ -810,6 +819,7 @@ export class AgentHubComponent {
 		if (data === "r" || data === "R") {
 			this.scanCache.clear();
 			this.lastSignature = "";
+			this.rpc.resetIdentify();
 			this.refreshRuns();
 			void this.refreshRpc();
 			return;
@@ -977,10 +987,15 @@ export class AgentHubComponent {
 		// The panel draws its own frame — the overlay paints no border of its
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
-		// Title, the stats strip padded above and below, body, the action row,
-		// bottom border, and the hint bar below the frame (omp keeps its key
-		// hints outside the box).
-		const bodyHeight = height - 7;
+		// The chrome sheds decoration before content as the panel shrinks:
+		// pads go first, then the stats strip, then the hint bar — the action
+		// row (the composer) and the body go last, because a composer the
+		// overlay clips is typing blind, the exact failure the parity round
+		// already paid for once. Total emitted lines always equal `height`.
+		const pads = height >= 12 ? 1 : 0;
+		const statsRow = height >= 9 ? 1 : 0;
+		const hintsRow = height >= 5 ? 1 : 0;
+		const bodyHeight = Math.max(0, height - 3 - hintsRow - statsRow - pads * 2);
 		this.lastChatHeight = Math.max(1, bodyHeight - 2);
 		const listWidth = Math.min(48, Math.max(26, Math.floor(innerWidth * 0.32)));
 		const chatWidth = Math.max(20, innerWidth - listWidth - 3);
@@ -1006,10 +1021,19 @@ export class AgentHubComponent {
 			const total = entry.tokens?.total;
 			return typeof total === "number" && Number.isFinite(total) && total > 0 ? sum + total : sum;
 		}, 0);
+		// Session scope has a third state: identity not known (bridge silent or
+		// answering without a session). Claiming "0 runs in this session" there
+		// asserted an evaluation that never ran — beside the bridge's own
+		// active count, a visible self-contradiction.
+		const sessionUnknown = this.scope === "session" && this.rpc.sessionId === undefined;
 		const scopeLabel = this.scope === "machine" ? "on this machine" : this.scope === "project" ? "in this project" : "in this session";
 		const statsParts = [
-			running > 0 ? this.theme.fg("warning", `⟳ ${running} running`) : dim("No agents running"),
-			dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} ${scopeLabel} · f scope`),
+			sessionUnknown
+				? dim("session not identified yet")
+				: running > 0
+					? this.theme.fg("warning", `⟳ ${running} running`)
+					: dim("No agents running"),
+			sessionUnknown ? dim("r retries · f scope") : dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} ${scopeLabel} · f scope`),
 			!this.rpcInfo.available
 				? dim("subagents not answering")
 				: this.rpcInfo.totalActive === undefined
@@ -1026,9 +1050,9 @@ export class AgentHubComponent {
 		const framed = (content: string): string => truncateToWidth(`${border("│")} ${pad(content, width - 4)} ${border("│")}`, width);
 
 		const lines: string[] = [frameRow(truncateToWidth(title, width - 4), "╭─", "╮")];
-		lines.push(framed(""));
-		lines.push(framed(truncateToWidth(stats, innerWidth)));
-		lines.push(framed(""));
+		if (pads) lines.push(framed(""));
+		if (statsRow) lines.push(framed(truncateToWidth(stats, innerWidth)));
+		if (pads) lines.push(framed(""));
 		const listLines = this.renderList(listWidth, bodyHeight, now);
 		const chatLines = this.renderChat(chatWidth, bodyHeight);
 		const separator = this.theme.fg("borderMuted", "│");
@@ -1039,8 +1063,11 @@ export class AgentHubComponent {
 		lines.push(framed(this.renderActionRow(innerWidth, now)));
 		lines.push(frameRow("", "╰─", "╯"));
 		// Outside the frame, the way omp carries its key hints.
-		lines.push(truncateToWidth(` ${dim(this.bottomHints())}`, width));
-		return lines;
+		if (hintsRow) lines.push(truncateToWidth(` ${dim(this.bottomHints())}`, width));
+		// Exact emission even below the ladder's floor (a terminal too small
+		// for the fixed chrome): never hand the overlay more lines than the
+		// height it will show.
+		return lines.length > height ? lines.slice(0, Math.max(1, height)) : lines;
 	}
 
 	private bottomHints(): string {
@@ -1051,7 +1078,7 @@ export class AgentHubComponent {
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest
-	 * action's outcome, the focused tool, or what the composer would do. */
+	 * action's outcome or what the composer would do. */
 	private renderActionRow(width: number, now: number): string {
 		const dim = (text: string): string => this.theme.fg("dim", text);
 		const row = this.selectedRow();
@@ -1130,6 +1157,9 @@ export class AgentHubComponent {
 		const capped = this.rows.length === MAX_ROWS;
 		const height = Math.max(2, capped ? fullHeight - 1 : fullHeight);
 		if (this.rows.length === 0) {
+			if (this.scope === "session" && this.rpc.sessionId === undefined) {
+				return [dim("session not identified yet"), dim("the bridge has not named this session"), dim("r retries · f changes scope")];
+			}
 			return [dim(`no runs ${this.scope === "machine" ? "found" : this.scope === "project" ? "in this project" : "in this session"}`), dim("f changes scope"), dim("q closes")];
 		}
 		// Two lines per entry, the way omp's roster reads: the name row with

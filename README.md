@@ -5,15 +5,20 @@ agents that [pi-subagents](https://github.com/nicobailon/pi-subagents) runs in
 the background — their **full conversations**, live, in one floating panel.
 
 ```
-╭─ Agent hub · 19 runs · rpc ✓ · 2 active ────────────────────────────────╮
-│ ▸● delegate · bash · 4s     │ delegate · running · gpt-5.6-luna · 0306c5│
-│  ✓ oracle · complete · 1d   │                                           │
-│  ✓ scout · complete · 1d    │  I'll run the exact command with a        │
-│  ✗ worker · failed · 15h    │  generous timeout.                        │
-│                             │ ╭───────────────────────────────────────╮ │
-│                             │ │ $ for i in $(seq 1 60); do echo …     │ │
-│                             │ ╰───────────────────────────────────────╯ │
-╰─ ↑/↓ select · J/K scroll · G follow · x expand · r rescan · q close ────╯
+╭─ Agent Hub ──────────────────────────────────────────────────────────────╮
+│                                                                          │
+│ ⟳ 1 running · 4 runs in this session · f scope · 1 active in this session│
+│                                                                          │
+│ ▸⟳ delegate      gpt-5.6-luna · 4s │ delegate · running · gpt-5.6-luna   │
+│    bash · 12s active · 2 req       │                                     │
+│  ✓ oracle        gpt-5.6-luna · 1d │  I'll run the exact command with a  │
+│    complete · 1m10s · 6 req        │  generous timeout.                  │
+│                                    │ ╭─────────────────────────────────╮ │
+│                                    │ │ $ for i in $(seq 1 60); do echo…│ │
+│                                    │ ╰─────────────────────────────────╯ │
+│ s steers the running child · i interrupt · D stop · o cwd · y copy path  │
+╰──────────────────────────────────────────────────────────────────────────╯
+ J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · f scope · x expand · …
 ```
 
 ## Why
@@ -50,7 +55,7 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 | `s` / `enter` | message the run — steers it live, or resumes a finished one |
 | `i` | interrupt (graceful, resumable) |
 | `D D` | stop the run (asks once) |
-| `x` | expand or collapse tool output (for tools pi renders) |
+| `x` / `X` / `ctrl+o` | expand or collapse tool output (for tools pi renders) |
 | `/`, then `n`/`N` | search the conversation and walk the matches |
 | `o` | open the child's working directory |
 | `y` | copy the session file path |

@@ -91,6 +91,13 @@ export class SubagentsRpc {
 		else if (typeof session?.sessionId === "string") this.sessionId = session.sessionId;
 	}
 
+	/** A user-invoked rescan re-arms identification: the budget exists to stop
+	 * silent background re-pinging, not to make an early "no session yet"
+	 * verdict permanent for the life of the overlay. */
+	resetIdentify(): void {
+		this.identifyAttempts = 0;
+	}
+
 	/** One ping to learn the session id when the ready broadcast predates us.
 	 * Bounded on ANSWERS that carried no session — a bridge with no UI context
 	 * yet would otherwise be re-pinged every refresh tick forever. Timeouts do
