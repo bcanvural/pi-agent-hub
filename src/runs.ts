@@ -124,7 +124,7 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 }
 
 /** Scan the runs root into list rows: parseable statuses only, most recent
- * first, capped. A row survives the residue filter when its session file still
+ * first. A row survives the residue filter when its session file still
  * exists (the runs worth reading) or it claims to be running and its heartbeat
  * is fresh (the runs worth watching). Test residue — hundreds of dirs on a
  * machine that has run the foreign extension's suite — fails both. */
@@ -166,7 +166,10 @@ export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunR
 
 	const kept = all.filter(row => row.sessionFileExists || (row.state === "running" && now - (row.lastUpdate ?? 0) < STALE_RUNNING_MS));
 	kept.sort((a, b) => (b.lastUpdate ?? b.startedAt ?? 0) - (a.lastUpdate ?? a.startedAt ?? 0));
-	return kept.slice(0, MAX_ROWS);
+	// Uncapped: the display bound belongs to the caller, after its scope
+	// filter — capping here let newer runs from other projects push a
+	// project's own runs out of the project view.
+	return kept;
 }
 
 /** Unique by construction: two runs cannot share a directory, where two could

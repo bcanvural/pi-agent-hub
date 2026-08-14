@@ -6,6 +6,12 @@
 import * as child_process from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+
+/** What the roster shows. Project is the default — "the agents of this work"
+ * is the usual question; the machine-wide view is the hub's superpower and
+ * stays one keypress away; session matches the stock inspector's scope. */
+type Scope = "project" | "session" | "machine";
+const SCOPE_ORDER: Scope[] = ["project", "session", "machine"];
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { findAck, readCapability, runnerReachable, steerInboxClosed, writeControlRequest, writeSteerRequestFile } from "./control-files.ts";
@@ -157,6 +163,8 @@ function capText(text: string, max: number): string {
 
 export class AgentHubComponent {
 	private rows: RunRow[] = [];
+	private scope: Scope = "project";
+	private readonly projectRoot = path.resolve(process.cwd());
 	private readonly scanCache: ScanCache = new Map();
 	private selectedKey: string | undefined;
 	private listWindowTop = 0;
@@ -232,9 +240,18 @@ export class AgentHubComponent {
 
 	// ── data ────────────────────────────────────────────────────────────────
 
+	private inScope(row: RunRow): boolean {
+		if (this.scope === "machine") return true;
+		if (this.scope === "project") return row.cwd !== undefined && path.resolve(row.cwd) === this.projectRoot;
+		// Session scope: ownership by session identity. Unknown identity (no
+		// bridge yet) matches nothing — the strip names the scope, so an empty
+		// roster reads as "none here", not as a broken hub.
+		return this.rpc.sessionId !== undefined && row.sessionId === this.rpc.sessionId;
+	}
+
 	private refreshRuns(): void {
 		if (this.disposed) return;
-		this.rows = scanRuns(asyncRunsRoot(), this.scanCache);
+		this.rows = scanRuns(asyncRunsRoot(), this.scanCache).filter(row => this.inScope(row)).slice(0, MAX_ROWS);
 		const wanted = this.rows.length > 0 ? rowKey(this.rows[0]!) : undefined;
 		if (!this.rows.some(row => rowKey(row) === this.selectedKey)) {
 			// Only when it actually changes: re-selecting `undefined` on an empty
@@ -247,7 +264,7 @@ export class AgentHubComponent {
 			if (row?.sessionFile && this.tail?.filePath !== row.sessionFile) this.attachTail(row);
 		}
 		const now = Date.now();
-		const signature = `${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.lastUpdate}|${row.currentTool}|${isStale(row, now)}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
+		const signature = `${this.scope}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.lastUpdate}|${row.currentTool}|${isStale(row, now)}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
 		if (signature !== this.lastSignature) {
 			this.lastSignature = signature;
 			this.tui.requestRender();
@@ -776,6 +793,12 @@ export class AgentHubComponent {
 			if (row) this.copySessionPath(row);
 			return;
 		}
+		if (data === "f") {
+			this.scope = SCOPE_ORDER[(SCOPE_ORDER.indexOf(this.scope) + 1) % SCOPE_ORDER.length]!;
+			this.lastSignature = "";
+			this.refreshRuns();
+			return;
+		}
 		if (data === "r" || data === "R") {
 			this.scanCache.clear();
 			this.lastSignature = "";
@@ -975,9 +998,10 @@ export class AgentHubComponent {
 			const total = entry.tokens?.total;
 			return typeof total === "number" && Number.isFinite(total) && total > 0 ? sum + total : sum;
 		}, 0);
+		const scopeLabel = this.scope === "machine" ? "on this machine" : this.scope === "project" ? "in this project" : "in this session";
 		const statsParts = [
 			running > 0 ? this.theme.fg("warning", `⟳ ${running} running`) : dim("No agents running"),
-			dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} on this machine`),
+			dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} ${scopeLabel} · f scope`),
 			!this.rpcInfo.available
 				? dim("subagents not answering")
 				: this.rpcInfo.totalActive === undefined
@@ -1015,7 +1039,7 @@ export class AgentHubComponent {
 		if (this.mode === "compose") return "enter send · esc cancel";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
-		return "J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · x expand · s message · i interrupt · D stop · / find · q close";
+		return "J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · f scope · x expand · s message · i interrupt · D stop · / find · q close";
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest
@@ -1098,7 +1122,7 @@ export class AgentHubComponent {
 		const capped = this.rows.length === MAX_ROWS;
 		const height = Math.max(2, capped ? fullHeight - 1 : fullHeight);
 		if (this.rows.length === 0) {
-			return [dim("no runs found"), dim("launch a background agent"), dim("and it appears here")];
+			return [dim(`no runs ${this.scope === "machine" ? "found" : this.scope === "project" ? "in this project" : "in this session"}`), dim("f changes scope"), dim("q closes")];
 		}
 		// Two lines per entry, the way omp's roster reads: the name row with
 		// the model and recency right-aligned, then a dim per-run stats row.
