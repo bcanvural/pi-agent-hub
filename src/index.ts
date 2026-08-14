@@ -56,7 +56,11 @@ export default function agentHubExtension(pi: ExtensionAPI): void {
 		description: "Open the agent hub: watch background agents' conversations live (/hub 40-100 sets its size)",
 		handler: async (args, ctx) => {
 			const arg = args?.trim();
-			if (arg) {
+			// Only a session that can SHOW the result may change the size: a
+			// headless /hub 55 used to write the preference and say nothing —
+			// the one feedback-free path through the feature was the one that
+			// wrote to disk.
+			if (arg && ctx.hasUI) {
 				const parsed = Number.parseInt(arg, 10);
 				if (Number.isFinite(parsed) && parsed >= 40 && parsed <= 100) {
 					saveSize(SETTINGS_FILE, clampSize(parsed));

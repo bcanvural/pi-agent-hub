@@ -7,6 +7,8 @@ import * as path from "node:path";
 export const DEFAULT_SIZE = 80;
 
 export function clampSize(size: number): number {
+	// Total over its contract: NaN would ride Math.round straight through.
+	if (!Number.isFinite(size)) return DEFAULT_SIZE;
 	return Math.min(100, Math.max(40, Math.round(size)));
 }
 
@@ -21,12 +23,18 @@ export function readSavedSize(file: string): number {
 }
 
 export function saveSize(file: string, size: number): void {
+	const tmp = `${file}.tmp-${process.pid}`;
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const tmp = `${file}.tmp-${process.pid}`;
 		fs.writeFileSync(tmp, `${JSON.stringify({ size: clampSize(size) })}\n`);
 		fs.renameSync(tmp, file);
 	} catch {
-		// A size that does not stick is an inconvenience, never a crash.
+		// A size that does not stick is an inconvenience, never a crash —
+		// but a written tmp whose rename failed is litter; sweep it.
+		try {
+			fs.rmSync(tmp, { force: true });
+		} catch {
+			// Even the sweep is best-effort.
+		}
 	}
 }
