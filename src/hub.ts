@@ -1092,16 +1092,21 @@ export class AgentHubComponent {
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
 		// The chrome sheds decoration before content as the panel shrinks:
-		// pads go first, then the stats strip, then the hint bar — the action
-		// row (the composer) and the body go last, because a composer the
-		// overlay clips is typing blind, the exact failure the parity round
+		// the gaps go first, then the stats strip, then the hint bar — the
+		// action row (the composer) and the body go last, because a composer
+		// the overlay clips is typing blind, the exact failure the parity round
 		// already paid for once. Total emitted lines always equal `height`.
-		// At full size the pads go too: edge-to-edge should not fake a margin
-		// inside the frame.
-		const pads = height >= 12 && this.sizePct < 100 ? 1 : 0;
+		// Both rows around the stats strip are structure, not margin, and both
+		// survive full size: the strip needs air on each side or it merges into
+		// the furniture it sits between — into the titled border above, into the
+		// roster below, where it reads as the list's first entry. The chat pane
+		// spends a row on exactly this separation under its own header
+		// (renderChat). They are still the first thing shed when the panel is
+		// too short to afford them.
 		const statsRow = height >= 9 ? 1 : 0;
+		const stripGap = statsRow && height >= 12 ? 1 : 0;
 		const hintsRow = height >= 5 ? 1 : 0;
-		const bodyHeight = Math.max(0, height - 3 - hintsRow - statsRow - pads * 2);
+		const bodyHeight = Math.max(0, height - 3 - hintsRow - statsRow - stripGap * 2);
 		this.lastChatHeight = Math.max(1, bodyHeight - 2);
 		const listWidth = Math.min(48, Math.max(26, Math.floor(innerWidth * 0.32)));
 		const chatWidth = Math.max(20, innerWidth - listWidth - 3);
@@ -1178,9 +1183,9 @@ export class AgentHubComponent {
 		const framed = (content: string): string => truncateToWidth(`${border("│")} ${pad(content, width - 4)} ${border("│")}`, width);
 
 		const lines: string[] = [frameRow(truncateToWidth(title, width - 4), "╭─", "╮")];
-		if (pads) lines.push(framed(""));
+		if (stripGap) lines.push(framed(""));
 		if (statsRow) lines.push(framed(truncateToWidth(stats, innerWidth)));
-		if (pads) lines.push(framed(""));
+		if (stripGap) lines.push(framed(""));
 		const listLines = this.renderList(listWidth, bodyHeight, now);
 		const chatLines = this.renderChat(chatWidth, bodyHeight);
 		const separator = this.theme.fg("borderMuted", "│");
