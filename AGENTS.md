@@ -50,11 +50,12 @@ history.
    tool names, cwd, bridge reply text — all come from another extension's
    `status.json`, often from model-chosen names. A control byte there clears
    the user's screen. `sanitizeLine` (output-tail.ts) is the one treatment.
-4. **Writes are confined to three surfaces**: RPC envelopes on pi's event bus,
+4. **Writes are confined to four surfaces**: RPC envelopes on pi's event bus,
    a run's own `control/` inbox (fallback only, atomic tmp+rename, upstream's
-   20-entry queue bound honoured), and user-invoked subprocesses. Session
-   files and status.json are never written. v0 was fully read-only; keep the
-   boundary explicit in any new write.
+   20-entry queue bound honoured), user-invoked subprocesses, and the hub's
+   own settings file (`~/.pi/agent/pi-agent-hub.json`, atomic tmp+rename).
+   Session files and status.json are never written. v0 was fully read-only;
+   keep the boundary explicit in any new write.
 5. **Cost tracks the viewport, not the session.** Sessions reach 7MB+; render
    only the window (`buildChatWindow` walks newest-first and stops), cache per
    record, never cache a record whose tool calls lack results (it would freeze
@@ -91,6 +92,7 @@ history.
 | `src/rpc.ts` | client for pi-subagents' `subagents:rpc:v1:*` bridge |
 | `src/control-files.ts` | capability/ack readers + fallback inbox writers |
 | `src/output-tail.ts` | bounded sanitized tail of a run's output log; exports `sanitizeLine` |
+| `src/settings.ts` | the hub's own settings file (panel size): defensive read, atomic write |
 
 ## Conventions
 

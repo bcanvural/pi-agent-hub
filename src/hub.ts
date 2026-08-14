@@ -19,6 +19,7 @@ import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts"
 import { formatCost, formatTokens, UsageMeter } from "./usage.ts";
 import { asyncRunsRoot, isStale, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
+import { DEFAULT_SIZE } from "./settings.ts";
 import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail } from "./session-view.ts";
 
 const LIST_REFRESH_MS = 2000;
@@ -162,6 +163,19 @@ function capText(text: string, max: number): string {
 	return capped;
 }
 
+/** Panel sizes `z` cycles through; /hub accepts any 40-100. */
+export const SIZE_PRESETS = [50, 60, 80, 100];
+
+/** The one place the size→overlay mapping lives: index.ts builds (and on
+ * resize mutates in place) the overlay options from this, and render()
+ * derives its height budget from the same margin. The overlay's maxHeight
+ * stays "100%" so whatever render() emits is what pi shows — the old
+ * hand-synced option/budget pair clipped the composer twice. Full size
+ * drops the floating margin: 100% means the screen. */
+export function overlayGeometry(sizePct: number): { width: `${number}%`; margin: number } {
+	return { width: `${sizePct}%`, margin: sizePct >= 100 ? 0 : 1 };
+}
+
 export class AgentHubComponent {
 	private rows: RunRow[] = [];
 	private scope: Scope = "session";
@@ -221,10 +235,23 @@ export class AgentHubComponent {
 	private readonly theme: Theme;
 	private readonly done: (result: undefined) => void;
 
-	constructor(tui: TUI, theme: Theme, events: RpcEvents, done: (result: undefined) => void, projectRoot?: string) {
+	private sizePct: number;
+	private readonly onSizeChange?: (size: number) => void;
+
+	constructor(
+		tui: TUI,
+		theme: Theme,
+		events: RpcEvents,
+		done: (result: undefined) => void,
+		projectRoot?: string,
+		sizePct?: number,
+		onSizeChange?: (size: number) => void,
+	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.done = done;
+		this.sizePct = sizePct ?? DEFAULT_SIZE;
+		this.onSizeChange = onSizeChange;
 		// pi's session cwd, not the launch dir: `pi --resume` adopts the
 		// session's directory while process.cwd() stays where pi was started,
 		// and runs record the session cwd — comparing against the wrong one
@@ -886,6 +913,15 @@ export class AgentHubComponent {
 			this.refreshRuns();
 			return;
 		}
+		if (data === "z") {
+			// Cycle the panel size; the owner (index.ts) mutates the overlay
+			// options we were mounted with, and pi re-resolves them next frame.
+			const next = SIZE_PRESETS.find(size => size > this.sizePct) ?? SIZE_PRESETS[0]!;
+			this.sizePct = next;
+			this.onSizeChange?.(next);
+			this.tui.requestRender();
+			return;
+		}
 		if (data === "r" || data === "R") {
 			this.scanCache.clear();
 			this.lastSignature = "";
@@ -1043,17 +1079,15 @@ export class AgentHubComponent {
 		// separator) stays muted: one focused panel, not more lines everywhere.
 		const border = (text: string): string => this.theme.fg("borderAccent", text);
 		const terminalRows = (this.tui as unknown as { terminal?: { rows?: number } }).terminal?.rows ?? 40;
-		// ~88% of the terminal: pi centers the overlay on the component's own
-		// height, and enough margin has to stay visible for "floating" to be
-		// true — but only just; the panel is the workspace while it's open.
-		//
-		// The floor is itself capped by what the overlay will show: pi clips a
-		// too-tall component bottom-first (maxHeight "90%", margin 1 — keep in
-		// step with index.ts), and the bottom of this layout is the hints, the
-		// border, and then the composer. A floor above the clip made a 16-row
-		// terminal render a composer nobody could see: type blind, send blind.
-		const overlayCeiling = Math.min(Math.floor(terminalRows * 0.9), terminalRows - 2);
-		const height = Math.min(overlayCeiling, Math.max(16, Math.min(Math.floor(terminalRows * 0.88), terminalRows - 4)));
+		// The size preset owns the height: the overlay clips only at the
+		// terminal (maxHeight "100%"), so emission here IS the panel. The
+		// 16-row floor keeps small terminals usable when the preset asks for
+		// less; the margin cap keeps the floor below what pi will show — a
+		// floor above the clip once made a 16-row terminal render a composer
+		// nobody could see: type blind, send blind.
+		const margin = overlayGeometry(this.sizePct).margin;
+		const availRows = Math.max(1, terminalRows - margin * 2);
+		const height = Math.min(availRows, Math.max(16, Math.floor((terminalRows * this.sizePct) / 100)));
 		// The panel draws its own frame — the overlay paints no border of its
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
@@ -1062,7 +1096,9 @@ export class AgentHubComponent {
 		// row (the composer) and the body go last, because a composer the
 		// overlay clips is typing blind, the exact failure the parity round
 		// already paid for once. Total emitted lines always equal `height`.
-		const pads = height >= 12 ? 1 : 0;
+		// At full size the pads go too: edge-to-edge should not fake a margin
+		// inside the frame.
+		const pads = height >= 12 && this.sizePct < 100 ? 1 : 0;
 		const statsRow = height >= 9 ? 1 : 0;
 		const hintsRow = height >= 5 ? 1 : 0;
 		const bodyHeight = Math.max(0, height - 3 - hintsRow - statsRow - pads * 2);
@@ -1153,20 +1189,30 @@ export class AgentHubComponent {
 			lines.push(framed(inner));
 		}
 		lines.push(framed(this.renderActionRow(innerWidth, now)));
+		// Inside the frame, above the floor: the panel is self-contained.
+		// Hints hanging under the border floated over the host conversation
+		// and read as belonging to neither.
+		if (hintsRow) lines.push(framed(dim(truncateToWidth(this.bottomHints(innerWidth), innerWidth))));
 		lines.push(frameRow("", "╰─", "╯"));
-		// Outside the frame, the way omp carries its key hints.
-		if (hintsRow) lines.push(truncateToWidth(` ${dim(this.bottomHints())}`, width));
 		// Exact emission even below the ladder's floor (a terminal too small
 		// for the fixed chrome): never hand the overlay more lines than the
 		// height it will show.
 		return lines.length > height ? lines.slice(0, Math.max(1, height)) : lines;
 	}
 
-	private bottomHints(): string {
+	private bottomHints(maxWidth: number): string {
 		if (this.mode === "compose") return "enter send · esc cancel";
 		if (this.mode === "search") return "enter find · esc cancel";
 		if (this.mode === "confirmStop") return "D confirm stop · any other key cancels";
-		return "J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · f scope · x expand · s message · i interrupt · D stop · / find · q close";
+		// Tiered to the frame, never truncated mid-key: narrow presets get a
+		// shorter list, not half a binding.
+		const tiers = [
+			"J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · f scope · z size · x expand · s message · i interrupt · D stop · / find · q close",
+			"J/K select · j/k scroll · f scope · z size · x expand · s message · D stop · / find · q close",
+			"J/K select · j/k scroll · s message · z size · q close",
+			"s message · q close",
+		];
+		return tiers.find(tier => tier.length <= maxWidth) ?? tiers[tiers.length - 1]!;
 	}
 
 	/** The row under the panes: the composer when typing, otherwise the latest

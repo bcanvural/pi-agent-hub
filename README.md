@@ -41,7 +41,10 @@ pi runs in), then the whole machine. The strip names the scope in force.
 pi install /path/to/pi-agent-hub        # or -l for one project
 ```
 
-`/hub` — or `alt+a`, the omp reflex — opens the panel. Each run shows what it
+`/hub` — or `alt+a`, the omp reflex — opens the panel. `/hub 80` opens it at
+80% of the terminal (any 40-100 sticks, saved to
+`~/.pi/agent/pi-agent-hub.json`), and `z` cycles 50 → 60 → 80 → 100 live —
+at 100 the panel is the screen. Each run shows what it
 cost: pi prices every model call into the child's session file — assistant
 turns, tool-result summaries, compactions — and the hub sums them by pi's own
 accounting rule. Filled in gradually after opening, `…` while a sum is still
@@ -61,6 +64,7 @@ counting, and per conversation (a child's own spend, not its grandchildren's).
 | `o` | open the child's working directory |
 | `y` | copy the session file path |
 | `f` | cycle scope: session → project → machine |
+| `z` | cycle panel size: 50 → 60 → 80 → 100% |
 | `r` | rescan runs |
 | `q` / `esc` | back to your conversation |
 
