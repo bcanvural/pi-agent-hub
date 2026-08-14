@@ -215,7 +215,7 @@ export class AgentHubComponent {
 	/** One meter per session file. Bounded and pruned; completed runs cost one
 	 * stat per occasional check after they converge. */
 	private readonly meters = new Map<string, UsageMeter>();
-	private meterRotation = 0;
+	private lastRotated: string | undefined;
 
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -366,9 +366,19 @@ export class AgentHubComponent {
 			if (meterFor(candidates[0]!).advance()) advanced = true;
 			const cold = candidates.find((file, index) => index > 0 && !meterFor(file).done);
 			if (cold && meterFor(cold).advance()) advanced = true;
-			this.meterRotation = (this.meterRotation + 1) % candidates.length;
-			const rotating = candidates[this.meterRotation]!;
-			if (rotating !== candidates[0] && rotating !== cold && meterFor(rotating).advance()) advanced = true;
+			// The rotating cursor is an IDENTITY, not a position: an index into
+			// a list whose length flaps can cycle a subset of positions and
+			// starve a row forever — present half the ticks, advanced on none,
+			// its frozen cost shown as settled. "Next after the last file
+			// advanced" reaches every present candidate regardless of churn.
+			const start = this.lastRotated ? candidates.indexOf(this.lastRotated) : -1;
+			for (let step = 1; step <= candidates.length; step++) {
+				const file = candidates[(start + step) % candidates.length]!;
+				if (file === candidates[0] || file === cold) continue;
+				this.lastRotated = file;
+				if (meterFor(file).advance()) advanced = true;
+				break;
+			}
 		}
 		if (advanced) this.tui.requestRender();
 	}

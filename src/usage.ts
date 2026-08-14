@@ -21,6 +21,13 @@ const DEFAULT_BUDGET_BYTES = 512 * 1024;
  * re-read before consuming more, because an in-place rewrite keeps the inode
  * and can come back larger — and a meter that misses it double-counts. */
 const ANCHOR_BYTES = 64;
+/** A single line is buffered at most this far; past it the line is discarded
+ * to the next newline. Real usage-bearing records are kilobytes — this cap
+ * exists because the alternative is unbounded memory and, past V8's string
+ * ceiling (~537MB), a decode that THROWS out of the poll timer and takes the
+ * whole session down (invariant 1). A >32MB record forfeits any money it
+ * carried; the meter stays alive. */
+const MAX_LINE_BYTES = 32 * 1024 * 1024;
 
 interface UsageShape {
 	totalTokens?: unknown;
@@ -42,12 +49,16 @@ export class UsageMeter {
 	fileMissing = false;
 	private offset = 0;
 	private leftover: Buffer[] = [];
+	private leftoverBytes = 0;
+	private discarding = false;
 	private anchor: Buffer = Buffer.alloc(0);
 	private identity = "";
 	private started = false;
+	private readonly maxLineBytes: number;
 
-	constructor(filePath: string) {
+	constructor(filePath: string, maxLineBytes = MAX_LINE_BYTES) {
 		this.filePath = filePath;
+		this.maxLineBytes = maxLineBytes;
 	}
 
 	private reset(): void {
@@ -56,6 +67,8 @@ export class UsageMeter {
 		this.totals.requests = 0;
 		this.offset = 0;
 		this.leftover = [];
+		this.leftoverBytes = 0;
+		this.discarding = false;
 		this.anchor = Buffer.alloc(0);
 		this.done = false;
 	}
@@ -131,21 +144,48 @@ export class UsageMeter {
 			? Buffer.from(chunk.subarray(-ANCHOR_BYTES))
 			: Buffer.from(Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES));
 
+		// A line that blew the cap is skipped to its terminating newline; the
+		// bytes after it are ordinary data again.
+		let body = chunk;
+		if (this.discarding) {
+			const endOfLine = body.indexOf(0x0a);
+			if (endOfLine === -1) return reappeared;
+			body = body.subarray(endOfLine + 1);
+			this.discarding = false;
+			if (body.length === 0) return reappeared;
+		}
+
 		// The partial line is kept as a LIST of chunks: a line larger than the
 		// budget then costs one copy per tick, where a single growing buffer
 		// re-copied everything seen so far every tick — quadratic across a
 		// multi-megabyte line, and measurably the dominant fill cost.
-		const newlineAt = chunk.lastIndexOf(0x0a);
+		const newlineAt = body.lastIndexOf(0x0a);
 		if (newlineAt === -1) {
-			this.leftover.push(Buffer.from(chunk));
+			this.leftover.push(Buffer.from(body));
+			this.leftoverBytes += body.length;
+			if (this.leftoverBytes > this.maxLineBytes) {
+				this.leftover = [];
+				this.leftoverBytes = 0;
+				this.discarding = true;
+			}
 			return reappeared;
 		}
-		const complete = chunk.subarray(0, newlineAt);
+		const complete = body.subarray(0, newlineAt);
 		const data = this.leftover.length > 0 ? Buffer.concat([...this.leftover, complete]) : complete;
-		this.leftover = newlineAt + 1 < chunk.length ? [Buffer.from(chunk.subarray(newlineAt + 1))] : [];
+		this.leftover = newlineAt + 1 < body.length ? [Buffer.from(body.subarray(newlineAt + 1))] : [];
+		this.leftoverBytes = this.leftover.length > 0 ? this.leftover[0]!.length : 0;
 
 		let changed = reappeared;
-		for (const line of data.toString("utf8").split("\n")) {
+		let text: string;
+		try {
+			text = data.toString("utf8");
+		} catch {
+			// Beyond V8's string ceiling the line cannot even be examined. The
+			// cap above makes this unreachable; if it is reached anyway, skip
+			// the data rather than let a throw out of a timer end the session.
+			text = "";
+		}
+		for (const line of text.split("\n")) {
 			// Cheap prefilter: parsing every multi-kilobyte tool-result line
 			// for nothing is most of the cost of reading a big session.
 			if (!line.includes('"usage"')) continue;
