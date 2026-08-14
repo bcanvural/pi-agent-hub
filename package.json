@@ -6,6 +6,7 @@
 	"description": "A hub inside pi for watching background subagents: full-fidelity chat view of any child, live, with the controls to go with it.",
 	"license": "MIT",
 	"keywords": ["pi-package", "pi-extension", "subagents", "fleet", "hub"],
+	"repository": { "type": "git", "url": "https://github.com/bcanvural/pi-agent-hub" },
 	"files": ["src", "README.md"],
 	"scripts": {
 		"typecheck": "tsc --noEmit"

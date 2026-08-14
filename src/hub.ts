@@ -286,7 +286,12 @@ export class AgentHubComponent {
 		if (this.disposed) return;
 		if (fleet.available) await this.rpc.identify();
 		if (this.disposed) return;
-		const changed = fleet.available !== this.rpcInfo.available || fleet.totalActive !== this.rpcInfo.totalActive;
+		const tokenSum = (entries: FleetSnapshot["entries"]): number =>
+			entries.reduce((sum, entry) => (typeof entry.tokens?.total === "number" && Number.isFinite(entry.tokens.total) && entry.tokens.total > 0 ? sum + entry.tokens.total : sum), 0);
+		const changed =
+			fleet.available !== this.rpcInfo.available ||
+			fleet.totalActive !== this.rpcInfo.totalActive ||
+			tokenSum(fleet.entries) !== tokenSum(this.rpcInfo.entries);
 		this.rpcInfo = fleet;
 		// Session identity arriving is what makes the session scope filterable —
 		// re-filter immediately rather than leaving the default view empty
