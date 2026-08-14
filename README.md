@@ -4,22 +4,10 @@ A hub inside [pi](https://github.com/earendil-works/pi) for watching the
 agents that [pi-subagents](https://github.com/nicobailon/pi-subagents) runs in
 the background — their **full conversations**, live, in one floating panel.
 
-```
-╭─ Agent Hub ──────────────────────────────────────────────────────────────╮
-│                                                                          │
-│ ⟳ 1 running · 4 runs in this session · f scope · 1 active in this session│
-│                                                                          │
-│ ▸⟳ delegate      gpt-5.6-luna · 4s │ delegate · running · gpt-5.6-luna   │
-│    bash · 12s active · 2 req       │                                     │
-│  ✓ oracle        gpt-5.6-luna · 1d │  I'll run the exact command with a  │
-│    complete · 1m10s · 6 req        │  generous timeout.                  │
-│                                    │ ╭─────────────────────────────────╮ │
-│                                    │ │ $ for i in $(seq 1 60); do echo…│ │
-│                                    │ ╰─────────────────────────────────╯ │
-│ s steers the running child · i interrupt · D stop · o cwd · y copy path  │
-╰──────────────────────────────────────────────────────────────────────────╯
- J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · f scope · x expand · …
-```
+![The Agent Hub](docs/hub.png)
+
+*The project moves quickly — the screenshot is here to give an idea and may
+trail the latest version.*
 
 ## Why
 
@@ -37,6 +25,15 @@ cross-extension RPC (`subagents:rpc:v1:*` on pi's event bus) supplies the
 liveness badge alongside. The roster opens scoped to **this session** — the agents this conversation
 launched; `f` widens to the project (runs whose recorded cwd is the directory
 pi runs in), then the whole machine. The strip names the scope in force.
+
+## Requirements
+
+- [pi](https://github.com/earendil-works/pi) ≥ 0.83 (developed against 0.84.x)
+- [pi-subagents](https://github.com/nicobailon/pi-subagents) installed in the
+  same pi — the hub speaks its versioned `v1` RPC and reads its run artifacts.
+  Developed and verified against **0.46.x**; the protocol is capability-gated,
+  and without the extension the hub still browses whatever artifacts exist,
+  view-only.
 
 ## Use
 
@@ -65,29 +62,7 @@ pi install /path/to/pi-agent-hub        # or -l for one project
 
 ## Status
 
-v0 — observe. Runs are listed newest-first (one row per step), stale
-"running" records from dead parents are labelled rather than believed, and
-the conversation follows the session file as it grows.
-
-Only the visible window is rendered, so cost tracks the viewport rather than
-the session: a cold pane on a 7 MB transcript is ~40 ms, and every record is
-rendered behind a catch, because an exception raised inside pi's render pass
-takes the whole session down with it.
-
-Tool output is drawn by pi's own renderers, so expand/collapse behaves as it
-does in the main window. A tool with no registered renderer has no collapsed
-form to offer — the pane prints what pi prints, bounded only against a
-pathologically large result.
-
-Messaging is honest about delivery, because delivery genuinely differs by run
-state: a live runner-backed child takes a steer between turns; an attached
-child's steer parks until the run is resumed; a finished or stranded run is
-resumed — revived with your message, answering into the same pane. Interrupt
-and stop ride the same channels. Control is session-scoped upstream, so runs
-launched by another pi session are labelled view-only unless a live detached
-runner is willing to take file-inbox requests — the one sanctioned
-cross-process channel.
-
-While a live child sits inside a long tool call, the pane tails the run's
-output log under the transcript — bounded and sanitized — so the wait is
-watchable.
+Observing, messaging (steer / resume / interrupt / stop, with delivery labels
+that say what actually happened), search, and the live output tail are all
+implemented. `DESIGN.md` records the protocol facts this is built on and the
+decisions behind them; `AGENTS.md` records the working invariants.
