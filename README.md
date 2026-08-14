@@ -7,7 +7,10 @@ the background — their **full conversations**, live, in one floating panel.
 ![The Agent Hub](docs/hub.png)
 
 *The project moves quickly — the screenshot is here to give an idea and may
-trail the latest version.*
+trail the latest version. Its look also owes to
+[pi-omp-feel](https://github.com/bcanvural/pi-omp-feel): the hub renders
+conversations through pi's own message components, so that theme reaches
+inside the panel too.*
 
 ## Why
 
