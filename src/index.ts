@@ -20,7 +20,7 @@ export default function agentHubExtension(pi: ExtensionAPI): void {
 				(tui, theme, _keybindings, done) => new AgentHubComponent(tui, theme, pi.events as unknown as RpcEvents, done, ctx.cwd),
 				{
 					overlay: true,
-					overlayOptions: { anchor: "center", width: "92%", minWidth: 70, maxHeight: "85%", margin: 1 },
+					overlayOptions: { anchor: "center", width: "96%", minWidth: 70, maxHeight: "90%", margin: 1 },
 				},
 			);
 		} finally {

@@ -1033,17 +1033,17 @@ export class AgentHubComponent {
 		// separator) stays muted: one focused panel, not more lines everywhere.
 		const border = (text: string): string => this.theme.fg("borderAccent", text);
 		const terminalRows = (this.tui as unknown as { terminal?: { rows?: number } }).terminal?.rows ?? 40;
-		// ~78% of the terminal: pi centers the overlay on the component's own
-		// height, and a panel that claims almost everything reads as glued to
-		// the top — the margins have to be visible for "floating" to be true.
+		// ~88% of the terminal: pi centers the overlay on the component's own
+		// height, and enough margin has to stay visible for "floating" to be
+		// true — but only just; the panel is the workspace while it's open.
 		//
 		// The floor is itself capped by what the overlay will show: pi clips a
-		// too-tall component bottom-first (maxHeight "85%", margin 1 — keep in
+		// too-tall component bottom-first (maxHeight "90%", margin 1 — keep in
 		// step with index.ts), and the bottom of this layout is the hints, the
 		// border, and then the composer. A floor above the clip made a 16-row
 		// terminal render a composer nobody could see: type blind, send blind.
-		const overlayCeiling = Math.min(Math.floor(terminalRows * 0.85), terminalRows - 2);
-		const height = Math.min(overlayCeiling, Math.max(16, Math.min(Math.floor(terminalRows * 0.78), terminalRows - 6)));
+		const overlayCeiling = Math.min(Math.floor(terminalRows * 0.9), terminalRows - 2);
+		const height = Math.min(overlayCeiling, Math.max(16, Math.min(Math.floor(terminalRows * 0.88), terminalRows - 4)));
 		// The panel draws its own frame — the overlay paints no border of its
 		// own, and unframed rows read as text floating over the app.
 		const innerWidth = Math.max(40, width - 4);
