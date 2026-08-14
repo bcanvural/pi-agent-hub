@@ -215,6 +215,7 @@ export class AgentHubComponent {
 	/** One meter per session file. Bounded and pruned; completed runs cost one
 	 * stat per occasional check after they converge. */
 	private readonly meters = new Map<string, UsageMeter>();
+	private meterRotation = 0;
 
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -327,9 +328,10 @@ export class AgentHubComponent {
 		if (pruned) this.tui.requestRender();
 	}
 
-	/** One meter advances per tick, selected run first: the cold fill of a
-	 * roster of multi-megabyte sessions spreads across ticks instead of
-	 * stalling the event loop, and converged meters cost a stat. */
+	/** At most three meters advance per tick (selected, first unconverged,
+	 * one rotating): the cold fill of a roster of multi-megabyte sessions
+	 * spreads across ticks instead of stalling the event loop, and a fully
+	 * converged roster costs two stats a tick. */
 	private advanceUsage(): void {
 		const candidates: string[] = [];
 		const selected = this.selectedRow();
@@ -344,19 +346,29 @@ export class AgentHubComponent {
 				if (this.meters.size <= 300) break;
 			}
 		}
-		// The selected meter always gets a look (its run may be growing); after
-		// it, the first meter that has not yet converged.
+		// Three looks per tick, all cheap when nothing changed: the selected
+		// meter (its run may be growing), the first meter that has not yet
+		// converged (the cold fill), and one ROTATING candidate regardless of
+		// state — without the rotation, a converged meter on a run that keeps
+		// running froze at whatever it read first and presented that number as
+		// settled: three of four running agents showing dead costs in the
+		// hub's own headline scenario.
 		let advanced = false;
-		for (const [index, file] of candidates.entries()) {
+		const meterFor = (file: string): UsageMeter => {
 			let meter = this.meters.get(file);
 			if (!meter) {
 				meter = new UsageMeter(file);
 				this.meters.set(file, meter);
 			}
-			if (index === 0 || !meter.done) {
-				if (meter.advance()) advanced = true;
-				if (!meter.done || index > 0) break;
-			}
+			return meter;
+		};
+		if (candidates.length > 0) {
+			if (meterFor(candidates[0]!).advance()) advanced = true;
+			const cold = candidates.find((file, index) => index > 0 && !meterFor(file).done);
+			if (cold && meterFor(cold).advance()) advanced = true;
+			this.meterRotation = (this.meterRotation + 1) % candidates.length;
+			const rotating = candidates[this.meterRotation]!;
+			if (rotating !== candidates[0] && rotating !== cold && meterFor(rotating).advance()) advanced = true;
 		}
 		if (advanced) this.tui.requestRender();
 	}
@@ -1075,13 +1087,27 @@ export class AgentHubComponent {
 		// active count, a visible self-contradiction.
 		const sessionUnknown = this.scope === "session" && this.rpc.sessionId === undefined;
 		const scopeLabel = this.scope === "machine" ? "on this machine" : this.scope === "project" ? "in this project" : "in this session";
-		let scopeCost = 0;
-		let scopeCostComplete = this.rows.length > 0;
-		for (const row of this.rows) {
-			const meter = this.usageFor(row.sessionFile);
-			if (meter) scopeCost += meter.totals.cost;
-			if (!meter?.done) scopeCostComplete = false;
+		// Summed over unique meters: revival rows share their original's
+		// session file, and summing per row would bill one conversation twice.
+		// Completeness is judged only over rows that CAN be metered — a run
+		// with no session file kept the ellipsis on forever.
+		const scopeMeters = new Set<UsageMeter>();
+		let scopeCostComplete = false;
+		{
+			let meterable = 0;
+			let done = 0;
+			for (const row of this.rows) {
+				const meter = this.usageFor(row.sessionFile);
+				if (row.sessionFile) meterable++;
+				if (meter) {
+					scopeMeters.add(meter);
+					if (meter.done) done++;
+				}
+			}
+			scopeCostComplete = meterable > 0 && done === meterable;
 		}
+		let scopeCost = 0;
+		for (const meter of scopeMeters) scopeCost += meter.totals.cost;
 		const statsParts = [
 			sessionUnknown
 				? dim("session not identified yet")

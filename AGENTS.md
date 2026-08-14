@@ -68,6 +68,17 @@ history.
    (keep remainders as *bytes*, copied — a `subarray` view pins the whole
    read), in-place rewrites that keep inode AND size growth (the 64-byte
    content anchor catches those), short reads, vanished files.
+8. **Money follows pi's accounting rule, not a plausible one.** Usage lives in
+   three record shapes (`getUsageCostBreakdown` in pi's `core/usage-totals`):
+   assistant and toolResult messages under `message.usage`, compaction and
+   branch-summary records at the top level. Reading only `message.usage`
+   silently dropped up to 4.7% of real sessions' spend — and a ground-truth
+   check written from the same wrong rule agreed with the bug by construction.
+   Verify against pi's own function, never against a hand-rolled sum.
+9. **A converged meter is not a finished one.** A running child's file grows
+   again after every `done`; anything cached per file needs a scheduled
+   re-look (the rotating candidate in `advanceUsage`), or every row but the
+   selected one freezes at first read and presents that number as settled.
 
 ## Layout
 

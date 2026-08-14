@@ -11,11 +11,21 @@
 // consume only what was appended.
 import * as fs from "node:fs";
 
+/** The worst tick is NOT set by this number: it is the completion tick of a
+ * single multi-megabyte line (~50ms parse on a 50MB pathological session),
+ * which no budget can split. The budget only paces the read; shrinking it
+ * measurably worsened total fill time, so it stays at a size that keeps
+ * ordinary ticks in the low single-digit milliseconds. */
 const DEFAULT_BUDGET_BYTES = 512 * 1024;
 /** Same rewrite detection as the transcript tail: the last consumed bytes are
  * re-read before consuming more, because an in-place rewrite keeps the inode
  * and can come back larger — and a meter that misses it double-counts. */
 const ANCHOR_BYTES = 64;
+
+interface UsageShape {
+	totalTokens?: unknown;
+	cost?: { total?: unknown };
+}
 
 export interface UsageTotals {
 	cost: number;
@@ -31,7 +41,7 @@ export class UsageMeter {
 	done = false;
 	fileMissing = false;
 	private offset = 0;
-	private leftover: Buffer = Buffer.alloc(0);
+	private leftover: Buffer[] = [];
 	private anchor: Buffer = Buffer.alloc(0);
 	private identity = "";
 	private started = false;
@@ -45,7 +55,7 @@ export class UsageMeter {
 		this.totals.tokens = 0;
 		this.totals.requests = 0;
 		this.offset = 0;
-		this.leftover = Buffer.alloc(0);
+		this.leftover = [];
 		this.anchor = Buffer.alloc(0);
 		this.done = false;
 	}
@@ -121,29 +131,51 @@ export class UsageMeter {
 			? Buffer.from(chunk.subarray(-ANCHOR_BYTES))
 			: Buffer.from(Buffer.concat([this.anchor, chunk]).subarray(-ANCHOR_BYTES));
 
-		const data = this.leftover.length > 0 ? Buffer.concat([this.leftover, chunk]) : chunk;
-		const lastNewline = data.lastIndexOf(0x0a);
-		if (lastNewline === -1) {
-			this.leftover = data === chunk ? Buffer.from(data) : data;
+		// The partial line is kept as a LIST of chunks: a line larger than the
+		// budget then costs one copy per tick, where a single growing buffer
+		// re-copied everything seen so far every tick — quadratic across a
+		// multi-megabyte line, and measurably the dominant fill cost.
+		const newlineAt = chunk.lastIndexOf(0x0a);
+		if (newlineAt === -1) {
+			this.leftover.push(Buffer.from(chunk));
 			return reappeared;
 		}
-		this.leftover = Buffer.from(data.subarray(lastNewline + 1));
+		const complete = chunk.subarray(0, newlineAt);
+		const data = this.leftover.length > 0 ? Buffer.concat([...this.leftover, complete]) : complete;
+		this.leftover = newlineAt + 1 < chunk.length ? [Buffer.from(chunk.subarray(newlineAt + 1))] : [];
 
 		let changed = reappeared;
-		for (const line of data.subarray(0, lastNewline).toString("utf8").split("\n")) {
-			// Cheap prefilter: only assistant records carry usage, and parsing
-			// every multi-kilobyte tool-result line for nothing is most of the
-			// cost of reading a big session.
+		for (const line of data.toString("utf8").split("\n")) {
+			// Cheap prefilter: parsing every multi-kilobyte tool-result line
+			// for nothing is most of the cost of reading a big session.
 			if (!line.includes('"usage"')) continue;
 			try {
-				const record = JSON.parse(line) as { message?: { usage?: { totalTokens?: unknown; cost?: { total?: unknown } } } };
-				const usage = record.message?.usage;
+				const record = JSON.parse(line) as {
+					type?: string;
+					usage?: UsageShape;
+					message?: { role?: string; usage?: UsageShape };
+				};
+				// Pi books usage in three record shapes (its getUsageCostBreakdown
+				// rule, mirrored here exactly): assistant and toolResult messages
+				// carry it under `message`; compaction and branch-summary records
+				// carry it at the TOP level — a full-context call, exactly the
+				// spend a long-running child incurs. Reading only `message.usage`
+				// silently dropped up to 4.7% of real sessions' money.
+				const usage = record.type === "message"
+					? (record.message?.role === "assistant" || record.message?.role === "toolResult"
+						? record.message.usage
+						: undefined)
+					: (record.type === "compaction" || record.type === "branch_summary"
+						? record.usage
+						: undefined);
 				if (!usage) continue;
 				const cost = usage.cost?.total;
 				const tokens = usage.totalTokens;
-				// Foreign numbers get the same suspicion as foreign strings.
-				if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) this.totals.cost += cost;
-				if (typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0) this.totals.tokens += tokens;
+				// Foreign numbers get the same suspicion as foreign strings —
+				// including absurd magnitude: 1e308 passes a finiteness check
+				// and one addition later every aggregate is Infinity.
+				if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0 && cost < 1e6) this.totals.cost += cost;
+				if (typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 && tokens < 1e12) this.totals.tokens += tokens;
 				this.totals.requests += 1;
 				changed = true;
 			} catch {
