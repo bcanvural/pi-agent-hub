@@ -307,13 +307,13 @@ export class AgentHubComponent {
 	 * blocked, so the rows that most need the probe are the ones a heartbeat
 	 * test rejects. Cost per tick: one readdir plus a read per pending request
 	 * per distinct candidate channel, memoized across rows. */
-	private refreshWaits(now: number): void {
+	private refreshWaits(rows: RunRow[], now: number): void {
 		this.waits.clear();
 		this.waitDirs.clear();
 		// Memoized by channel identity, not by row: twins share a probe, and a
 		// candidate already found empty is not re-read for the next row.
 		const probed = new Map<string, SupervisorWait | undefined>();
-		for (const row of this.rows) {
+		for (const row of rows) {
 			if (row.state !== "running") continue;
 			// The run's own channel first, the inherited child's as a fallback:
 			// a revived run launches under its own id and keeps the original's
@@ -397,9 +397,92 @@ export class AgentHubComponent {
 		return beat > 0 ? `no answer for ${formatDuration(now - beat)}` : "no answer · no heartbeat recorded";
 	}
 
+	/** Rows merged away because another record of the same conversation speaks
+	 * for them, keyed by the survivor: rowKey -> total records. Rebuilt every
+	 * refresh. */
+	private readonly recordCounts = new Map<string, number>();
+
 	private refreshRuns(): void {
 		if (this.disposed) return;
-		this.rows = scanRuns(asyncRunsRoot(), this.scanCache).filter(row => this.inScope(row)).slice(0, MAX_ROWS);
+		const now = Date.now();
+		const scoped = scanRuns(asyncRunsRoot(), this.scanCache).filter(row => this.inScope(row));
+		// One row per CONVERSATION. A revived run launches under its own id but
+		// continues the original child's session file, so two rows tail one
+		// file and render the identical chat — the same conversation shown
+		// twice, which reads as a phantom second agent. The liveliest record
+		// speaks for the group (a recorded "running" first, then the freshest
+		// beat) and wears the group's record count; actions then target the
+		// record that can still take them. Rows without a session file have
+		// nothing to share and never merge.
+		const groups = new Map<string, RunRow[]>();
+		for (const row of scoped) {
+			const key = row.sessionFile ?? `#${rowKey(row)}`;
+			const list = groups.get(key);
+			if (list) list.push(row);
+			else groups.set(key, [row]);
+		}
+		// Waits are probed over the PRE-merge records. Probing survivors only
+		// meant the verdict was computed before the information that could
+		// correct it existed — the third time this changeset paid for that
+		// layering (isStale in round 1, directory existence in round 4): a
+		// parked original was never probed once a finished sibling record
+		// outranked it, and the buried conversation showed ✓ with "s resumes"
+		// offered against a provably parked child.
+		this.refreshWaits(scoped, now);
+		this.recordCounts.clear();
+		const hiddenToSurvivor = new Map<string, string>();
+		const merged: RunRow[] = [];
+		for (const group of groups.values()) {
+			let best = group[0]!;
+			for (const candidate of group.slice(1)) {
+				// ALIVE NOW outranks, judged with the channel in view — a parked
+				// child's heartbeat is frozen, so an isStale test called it dead
+				// and buried its unanswered question behind a finished sibling
+				// record. Before that, a bare "recorded running" test let detach
+				// residue outrank a fresh completion forever — the one word
+				// invariant 6 already calls untrustworthy, trusted by the merge
+				// added to serve it. Everything not alive competes on beat, so
+				// the freshest final record speaks for a finished conversation.
+				const alive = (row: RunRow): boolean => {
+					const liveness = this.liveness(row, now);
+					return liveness === "live" || liveness === "parked";
+				};
+				const bestLive = alive(best);
+				const candidateLive = alive(candidate);
+				if (candidateLive !== bestLive ? candidateLive : lastBeat(candidate, now) > lastBeat(best, now)) best = candidate;
+			}
+			if (group.length > 1) {
+				this.recordCounts.set(rowKey(best), group.length);
+				for (const row of group) if (row !== best) hiddenToSurvivor.set(rowKey(row), rowKey(best));
+			}
+			merged.push(best);
+		}
+		this.rows = merged.slice(0, MAX_ROWS);
+		// A selection on a merged-away record follows its conversation to the
+		// survivor instead of snapping to the top of the list. The KEY swaps,
+		// nothing else: rows only merge because they share a session file, so
+		// the survivor tails the same file and there is nothing to reset —
+		// going through select() yanked a reader scrolled up in history back
+		// to the tail and re-read the whole session file for no new content.
+		if (this.selectedKey !== undefined && hiddenToSurvivor.has(this.selectedKey)) {
+			this.selectedKey = hiddenToSurvivor.get(this.selectedKey);
+		}
+		// In-flight outcomes follow the conversation too: a notice or an ack
+		// watch keyed to a merged-away record silently vanished — the result
+		// of the user's own last action, lost at the moment it landed.
+		for (const [key, notice] of [...this.notices]) {
+			const survivor = hiddenToSurvivor.get(key);
+			if (survivor === undefined) continue;
+			this.notices.delete(key);
+			const standing = this.notices.get(survivor);
+			if (standing === undefined || standing.at < notice.at) this.notices.set(survivor, notice);
+		}
+		if (this.ackWatch !== undefined) {
+			const survivor = hiddenToSurvivor.get(this.ackWatch.runKey);
+			// The display target only: runDir/index still name the hidden run's
+			// control files, which is where the ack actually lands.
+			if (survivor !== undefined) this.ackWatch.runKey = survivor;
+		}
 		const wanted = this.rows.length > 0 ? rowKey(this.rows[0]!) : undefined;
 		if (!this.rows.some(row => rowKey(row) === this.selectedKey)) {
 			// Only when it actually changes: re-selecting `undefined` on an empty
@@ -411,13 +494,14 @@ export class AgentHubComponent {
 			const row = this.selectedRow();
 			if (row?.sessionFile && this.tail?.filePath !== row.sessionFile) this.attachTail(row);
 		}
-		const now = Date.now();
-		this.refreshWaits(now);
 		// A child parking on a supervisor reply changes nothing else about the
 		// run — same state, same heartbeat — so the wait belongs in the
 		// signature or the row would keep its old label until something else
-		// moved.
-		const signature = `${this.scope}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.detached}|${this.liveness(row, now)}|${this.waitFor(row)?.requestId}|${row.lastUpdate}|${row.currentTool}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
+		// moved. The time bucket keeps relative ages honest: a parked child
+		// writes NOTHING, so without it the signature froze and the panel
+		// stopped repainting entirely — "12s active" still on screen three
+		// minutes into the park. One repaint per five seconds is the cost.
+		const signature = `${this.scope}|t:${Math.floor(now / 5000)}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.detached}|${this.liveness(row, now)}|${this.waitFor(row)?.requestId}|${this.recordCounts.get(rowKey(row)) ?? 1}|${row.lastUpdate}|${row.currentTool}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
 		if (signature !== this.lastSignature) {
 			this.lastSignature = signature;
 			this.tui.requestRender();
@@ -1562,8 +1646,12 @@ export class AgentHubComponent {
 			const cost = meter && (meter.done || meter.totals.cost > 0)
 				? `${formatCost(meter.totals.cost)}${meter.done ? "" : "…"}`
 				: row.sessionFileExists ? "$…" : undefined;
+			const records = this.recordCounts.get(rowKey(row));
 			const statsParts = [
 				`${step}${detail}`,
+				// Honest about the merge: this row speaks for more than one run
+				// record of the same conversation (a revival and its original).
+				...(records !== undefined ? [`${records} records`] : []),
 				...(cost ? [cost] : []),
 				...(active ? [`${active} active`] : []),
 				...(row.turnCount !== undefined ? [`${row.turnCount} req`] : []),
@@ -1724,5 +1812,6 @@ export class AgentHubComponent {
 		this.rpc.dispose();
 		this.waits.clear();
 		this.waitDirs.clear();
+		this.recordCounts.clear();
 	}
 }

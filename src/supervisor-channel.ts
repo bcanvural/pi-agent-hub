@@ -54,6 +54,29 @@ export function waitExpired(wait: SupervisorWait, now: number): boolean {
  * column wider than `visibleWidth` reports. */
 const MAX_MESSAGE_CHARS = 240;
 
+/** The part of the envelope a person is meant to read. Upstream prefixes the
+ * child's message with a metadata header (Run:/Agent:/Child index:) separated
+ * by a blank line; quoting from the top rendered 240 characters of ids with
+ * their newlines deleted — "decision.Run: d2631a9a…Agent: df-reviewer…" — and
+ * the actual question never made the row. Newlines collapse to spaces because
+ * the destination is one row: sanitizeLine would DELETE them and fuse words. */
+function displayBody(value: unknown): string {
+	if (typeof value !== "string") return "";
+	// A blank line by any spelling: upstream writes "\n\n", but a foreign
+	// runner writing CRLF ("\r\n\r\n" contains no "\n\n") got exactly the
+	// metadata leak this function was written to remove.
+	const separator = /(?:\r?\n|[\u2028\u2029])[ \t]*(?:\r?\n|[\u2028\u2029])/.exec(value);
+	const body = separator ? value.slice(separator.index + separator[0].length) : value;
+	const flat = body.replace(/\s+/g, " ").trim();
+	// Judged empty by what a reader can SEE: a body of zero-width spaces is
+	// "non-empty" to \s and rendered an invisible quotation. Zero-widths are
+	// stripped only for this test, never from the output — ZWJ binds emoji
+	// clusters and removing it would break them.
+	const visible = flat.replace(/[\u200b-\u200d\u2060\ufeff]/g, "");
+	if (visible) return flat;
+	return value.replace(/\s+/g, " ").trim();
+}
+
 function clip(value: unknown): string {
 	if (typeof value !== "string") return "";
 	// Length-guarded before any allocation. `Array.from` over the whole string
@@ -215,7 +238,7 @@ function readRequest(file: string, channel: SupervisorChannel): SupervisorWait |
 	return {
 		requestId: id,
 		reason: clip(record.reason),
-		message: clip(record.message),
+		message: clip(displayBody(record.message)),
 		createdAt: number(record.createdAt) ?? 0,
 		expiresAt: number(record.expiresAt),
 	};

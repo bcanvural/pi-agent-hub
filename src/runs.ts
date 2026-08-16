@@ -276,11 +276,14 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			detached: state === "running" && runOver,
 			needsAttention: asString(step.activityState) === "needs_attention",
 			// The run's reason speaks for a step ONLY when there is one step to
-			// speak for. Falling back for every step printed the wrapper's
-			// "Detached for intercom coordination" under all four healthy
-			// siblings of the one that failed — the same misattribution this
-			// whole changeset exists to end, one level down.
-			error: asReason(step.error) ?? (steps.length === 1 ? asReason(status.error) : undefined),
+			// speak for AND that step's own verdict agrees something went wrong.
+			// Falling back for every step printed the wrapper's "Detached for
+			// intercom coordination" under all four healthy siblings of the one
+			// that failed — and borrowing it under a ✓ told the reader a
+			// completed child had failed, when the detach was the wrapper's
+			// story and the child finished fine.
+			error: asReason(step.error)
+				?? (steps.length === 1 && (state === "failed" || state === "stopped" || state === "rejected") ? asReason(status.error) : undefined),
 			stepStatus,
 			model: asString(step.model),
 			thinking: asString(step.thinking),
