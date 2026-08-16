@@ -83,6 +83,13 @@ export interface RunRow {
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolArgs?: string;
+	/** When the in-flight tool call started. The honest clock for a blocking
+	 * ask: the heartbeat is neither bound on one — measured on real records it
+	 * both freezes at ask start AND advances mid-ask (276s, once), so dating an
+	 * ask by activity either robs it of its window or grants it one it never
+	 * had. Present only while a tool IS in flight, which is exactly when the
+	 * question is asked. */
+	currentToolStartedAt?: number;
 	turnCount?: number;
 	toolCount?: number;
 	sessionFile?: string;
@@ -294,6 +301,7 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			lastActivityAt: asNumber(step.lastActivityAt),
 			currentTool: asString(step.currentTool),
 			currentToolArgs: asString(step.currentToolArgs),
+			currentToolStartedAt: asNumber(step.currentToolStartedAt),
 			turnCount: asNumber(step.turnCount),
 			toolCount: asNumber(step.toolCount),
 			sessionFile,

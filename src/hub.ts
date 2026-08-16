@@ -18,7 +18,7 @@ import { findAck, readCapability, runnerReachable, steerInboxClosed, writeContro
 import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts";
 import { formatCost, formatTokens, UsageMeter } from "./usage.ts";
 import { asyncRunsRoot, isStale, lastBeat, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
-import { readSupervisorWait, supervisorChannels, waitExpired, type SupervisorChannel, type SupervisorWait } from "./supervisor-channel.ts";
+import { askTimeoutMs, readSupervisorWait, supervisorChannels, waitExpired, type SupervisorChannel, type SupervisorWait } from "./supervisor-channel.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
 import { DEFAULT_SIZE } from "./settings.ts";
 import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail } from "./session-view.ts";
@@ -371,13 +371,34 @@ export class AgentHubComponent {
 		// away from six ✓/✗ glyphs.
 		if (row.state !== "running") return "ended";
 		const wait = this.waitFor(row);
+		// Upstream's own flag is how a blocking `intercom ask` — to the
+		// orchestrator OR to a sibling — becomes visible at all: it is set the
+		// instant the tool starts and cleared when it returns
+		// (`isBlockingSupervisorTool`, subagent-runner.ts), so while it stands
+		// the child is by construction still inside that call. It carries no
+		// deadline, so it is measured against the ask timeout both systems
+		// share — dated from the tool's OWN clock where the artifact has one,
+		// because the heartbeat bounds an ask in neither direction: it freezes
+		// at ask start on some records and advances mid-ask on others.
+		// The window comes from the same reader the request envelopes are dated
+		// with, so an operator who lengthens or shortens asks moves both paths
+		// together. Only the flag branch needs it: an envelope carries its own
+		// `expiresAt` and is env-correct by construction.
+		const flagged = row.needsAttention
+			&& now - (row.currentToolStartedAt ?? lastBeat(row, now)) < askTimeoutMs();
+		// An unexpired request is the best evidence there is — it carries the
+		// question itself.
+		if (wait && !waitExpired(wait, now)) return "parked";
+		// Then the flag, ahead of anything derived from silence. A standing flag
+		// says the child is inside a blocking call NOW, while an expired request
+		// is stale evidence about an ask already abandoned; letting the dead
+		// evidence win labelled a live park "no answer for 5m".
+		if (flagged) return "parked";
 		// A heartbeat that moved after the ask expired proves the child gave up
 		// waiting and went back to work.
-		if (wait) return !waitExpired(wait, now) ? "parked" : isStale(row, now) ? "unknown" : "live";
-		// Upstream's own flag, for the runs whose channel this process cannot
-		// resolve. It carries no deadline, so a frozen heartbeat under it is the
-		// same unknown.
-		if (row.needsAttention) return isStale(row, now) ? "unknown" : "parked";
+		if (wait) return isStale(row, now) ? "unknown" : "live";
+		// Flag set but the ask outlived its window: nothing knowable from here.
+		if (row.needsAttention) return "unknown";
 		return isStale(row, now) ? "stale" : "live";
 	}
 
@@ -1526,8 +1547,14 @@ export class AgentHubComponent {
 				// asked — and the message was being read, bounded and dropped.
 				const wait = this.waitFor(row);
 				const asked = sanitizeLine(wait?.message || wait?.reason || "");
-				const quoted = asked ? ` — “${asked}”` : "";
-				return dim(`parked: answer in the conversation${quoted} · i interrupt · D stop · o cwd · y copy path`);
+				// Only a request envelope proves the ask was addressed HERE.
+				// Upstream raises the same flag for `intercom ask`, which may be
+				// addressed to a SIBLING — telling this operator to answer a
+				// question asked of another agent, with no question attached
+				// because there is no envelope to quote. Without one, say the
+				// child is blocked and stop short of naming who owes the reply.
+				if (!asked) return dim("parked on a reply · i interrupt · D stop · o cwd · y copy path");
+				return dim(`parked: answer in the conversation — “${asked}” · i interrupt · D stop · o cwd · y copy path`);
 			}
 			// "the running child" is a claim, and after an ask ran out with the
 			// heartbeat frozen it is exactly the claim nothing supports.

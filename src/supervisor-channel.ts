@@ -31,10 +31,25 @@ export interface SupervisorWait {
 	expiresAt: number | undefined;
 }
 
-/** Upstream's default ask timeout, measured on a real envelope
- * (`expiresAt - createdAt === 600000`). Used only to date a request that
- * carries no `expiresAt` of its own. */
+/** Upstream's ask timeout — a configurable DEFAULT, not a constant. Both
+ * systems that park a child read the same override
+ * (`PI_INTERCOM_ASK_TIMEOUT_MS`: pi-subagents' `askTimeoutMs`, pi-intercom's
+ * `getAskTimeoutMs`) and both ship 10 minutes, and the variable reaches this
+ * process too — so re-declaring the number locally was the sanitizer-mirror
+ * mistake a third time. With a 30-minute override, a hardcoded 600s calls a
+ * legitimately blocked child unanswered at 11 minutes; with a 60s override it
+ * claims a park for nine minutes after the child gave up.
+ *
+ * Parsed leniently ON PURPOSE. pi-intercom's own reader THROWS on a malformed
+ * value; upstream's subagents reader falls back, and so does this one — a
+ * throw here would come off the render/tick path and take the host session
+ * down (invariant 1) over a typo in an env var. */
 const DEFAULT_ASK_TIMEOUT_MS = 600_000;
+
+export function askTimeoutMs(): number {
+	const parsed = Number(process.env.PI_INTERCOM_ASK_TIMEOUT_MS);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ASK_TIMEOUT_MS;
+}
 
 /** Past its deadline the child's poll has thrown and it has moved on: whatever
  * else is true, it is no longer parked on this. A request that cannot be dated
@@ -42,7 +57,7 @@ const DEFAULT_ASK_TIMEOUT_MS = 600_000;
  * not evidence for it. */
 export function waitExpired(wait: SupervisorWait, now: number): boolean {
 	if (wait.expiresAt !== undefined) return now >= wait.expiresAt;
-	if (wait.createdAt > 0) return now >= wait.createdAt + DEFAULT_ASK_TIMEOUT_MS;
+	if (wait.createdAt > 0) return now >= wait.createdAt + askTimeoutMs();
 	return true;
 }
 
