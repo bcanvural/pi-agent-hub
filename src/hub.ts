@@ -23,6 +23,40 @@ import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
 import { DEFAULT_SIZE } from "./settings.ts";
 import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail } from "./session-view.ts";
 
+/** Whether an in-flight tool call means the child is BLOCKED on a reply.
+ *
+ * The flag alone cannot say it: `needs_attention` has FOUR writers and only
+ * one is a park. The idle escalation (`deriveActivityState`) fires precisely
+ * when no tool is in flight; the repeated-failure escalation fires after the
+ * tool ended; `markSteeringAttention` fires when a steer could not be
+ * delivered, under whatever happened to be running. Trusting the flag alone
+ * demanded a reply from the operator for children that were merely thinking —
+ * every flagged row on this machine's disk is that kind: terminal, no tool,
+ * flag never cleared, because nothing clears it.
+ *
+ * Upstream's own predicate (`isBlockingSupervisorTool`) is name AND args, and
+ * the name alone is a SUPERSET: 6 of pi-intercom's 7 actions and 1 of
+ * `contact_supervisor`'s 3 reasons carry a blocking name while returning
+ * immediately. The args cannot be mirrored faithfully — `currentToolArgs` is a
+ * lossy single-key preview whose key depends on the order the model emitted
+ * them — so the preview is treated as a WITNESS, not a requirement: it rejects
+ * a park when it positively contradicts one, and stays silent when it cannot
+ * say. Requiring it instead would drop real parks whose preview happened to
+ * capture `message=…`, and a missed park reads as calm, which is the worse
+ * failure. */
+const BLOCKING_TOOLS = new Set(["intercom", "contact_supervisor"]);
+
+function isBlockingCall(tool: string | undefined, argsPreview: string | undefined): boolean {
+	if (tool === undefined || !BLOCKING_TOOLS.has(tool)) return false;
+	const preview = argsPreview ?? "";
+	if (tool === "intercom") {
+		const action = /(?:^|[^A-Za-z])action=([A-Za-z_]+)/.exec(preview)?.[1];
+		return action === undefined || action === "ask";
+	}
+	const reason = /(?:^|[^A-Za-z])reason=([A-Za-z_]+)/.exec(preview)?.[1];
+	return reason === undefined || reason === "need_decision" || reason === "interview_request";
+}
+
 const LIST_REFRESH_MS = 2000;
 const TAIL_POLL_MS = 500;
 const ACK_WAIT_MS = 25_000;
@@ -385,6 +419,7 @@ export class AgentHubComponent {
 		// together. Only the flag branch needs it: an envelope carries its own
 		// `expiresAt` and is env-correct by construction.
 		const flagged = row.needsAttention
+			&& isBlockingCall(row.currentTool, row.currentToolArgs)
 			&& now - (row.currentToolStartedAt ?? lastBeat(row, now)) < askTimeoutMs();
 		// An unexpired request is the best evidence there is — it carries the
 		// question itself.
@@ -397,8 +432,12 @@ export class AgentHubComponent {
 		// A heartbeat that moved after the ask expired proves the child gave up
 		// waiting and went back to work.
 		if (wait) return isStale(row, now) ? "unknown" : "live";
-		// Flag set but the ask outlived its window: nothing knowable from here.
-		if (row.needsAttention) return "unknown";
+		// A BLOCKING ask that outlived its window: the beat froze because of the
+		// park, so silence proves nothing either way. Any other flag — the idle
+		// escalation, a failure escalation — is not a park and must not borrow
+		// the park's verdict: those rows fall through to the heartbeat, which
+		// is the only thing actually measured about them.
+		if (row.needsAttention && isBlockingCall(row.currentTool, row.currentToolArgs)) return "unknown";
 		return isStale(row, now) ? "stale" : "live";
 	}
 

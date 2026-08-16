@@ -112,6 +112,41 @@ writer (verified upstream; see nicobailon/pi-subagents#1019).
   run-id candidate collapsed every same-agent sibling of a fan-out onto one
   channel; the step's own index is the correct key there.
 
+### `needs_attention` has four writers and only one is a park
+
+Enumerated across pi-subagents 0.46.0; only writes to **`step.activityState`**
+reach the hub (`status.activityState` is never read):
+
+| site | means | sets `currentTool`? |
+|---|---|---|
+| `subagent-runner.ts:2766` (`isBlockingSupervisorTool`) | **the park** | yes, same event; cleared together |
+| `:2530` (`markSteeringAttention`) | a steer could not be delivered | no — whatever was in flight |
+| `:2828` | repeated mutating-tool failures | no — fires after the tool ended |
+| `:2905` (`deriveActivityState`) | idle 60s+ | no, by construction |
+
+Nothing ever clears the flag on the last three paths, so it is set-once and
+frozen: every flagged row on this machine is terminal with no tool. Treating
+the flag alone as a park demanded replies for children that were merely
+thinking. The park verdict is therefore gated on a blocking call being in
+flight, with the args preview as a witness that can veto (see
+`isBlockingCall`) — never as a requirement, because `extractToolArgsPreview`
+records one key chosen by emission order and a missed park reads as calm.
+
+Two upstream behaviours this rests on, neither enforceable from here:
+
+- **`currentTool` outlives its call on any exit without a `tool_execution_end`
+  event** (crash, kill, pause, detach, interrupt) — the only clears are that
+  handler and `resetStepLiveDetail`, whose call sites are all at step *start*.
+  A real leftover is on disk now: run `a001acc7`, `paused`, still holding
+  `currentTool: intercom` ten hours on. Harmless there (a non-running row is
+  `ended`), but a *detached* step frozen at `running` plus a steer failure
+  could pair a stranded tool with a fresh flag. Bounded: `currentToolStartedAt`
+  is stranded alongside it, so the window expires from the original tool start
+  and the row degrades to `unknown` after one ask timeout.
+- **`currentToolStartedAt` and `currentTool` are written and deleted in the
+  same statements**, so a record carrying one carries the other; the
+  `?? lastBeat` fallback exists only for a truncated or foreign status.json.
+
 ### Recorded assumptions the channel probe rests on (round-5 findings)
 
 - **A run's recorded id is never another row's child-session segment.** If it
