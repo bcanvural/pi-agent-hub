@@ -18,7 +18,12 @@ export interface OutputTail {
 const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const CSI = /\x1b\[[0-9;:?]*[ -/]*[@-~]/g;
 const OTHER_ESCAPE = /\x1b./g;
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+// U+2028/U+2029 are line separators outside the C0/C1 ranges: not terminal
+// control bytes, but a line break all the same, and a "line" carrying one
+// becomes two rows in whatever renders it next. Newly reachable when a
+// supervisor request's message — genuinely multi-line upstream — began
+// being rendered.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
 
 /** One line of untrusted text made safe for a terminal row: escapes and
  * control bytes stripped, tabs spaced. Exported because every foreign string

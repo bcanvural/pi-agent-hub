@@ -17,7 +17,8 @@ import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui"
 import { findAck, readCapability, runnerReachable, steerInboxClosed, writeControlRequest, writeSteerRequestFile } from "./control-files.ts";
 import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts";
 import { formatCost, formatTokens, UsageMeter } from "./usage.ts";
-import { asyncRunsRoot, isStale, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
+import { asyncRunsRoot, isStale, lastBeat, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
+import { readSupervisorWait, supervisorChannels, waitExpired, type SupervisorChannel, type SupervisorWait } from "./supervisor-channel.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
 import { DEFAULT_SIZE } from "./settings.ts";
 import { bottomOffsetOfRecord, buildChatWindow, recordPlainText, SessionTail } from "./session-view.ts";
@@ -286,6 +287,116 @@ export class AgentHubComponent {
 		return this.rpc.sessionId !== undefined && row.sessionId === this.rpc.sessionId;
 	}
 
+	/** Supervisor waits, keyed by CHANNEL directory rather than by row. A
+	 * revival row shares its original's session file and therefore its child's
+	 * channel, and keying by row counted one parked child twice — the same
+	 * double count the cost meters already dedupe against (`scopeMeters`). */
+	private readonly waits = new Map<string, SupervisorWait>();
+	private readonly waitDirs = new Map<string, string>();
+
+	/** A channel's identity as one unambiguous string. JSON-encoded because the
+	 * tuple must not be re-parseable into a different tuple: joining on a
+	 * separator only moved the collision from "-" onto that separator, and two
+	 * children sharing a key meant one child's verdict was cached for both. */
+	private static channelKey(channel: SupervisorChannel): string {
+		return JSON.stringify([channel.dir, channel.childRunId, channel.agent, channel.childIndex]);
+	}
+
+	/** Probed for every RUNNING row, stale or not. Gating this on freshness was
+	 * exactly backwards: a parked child stops emitting activity BECAUSE it is
+	 * blocked, so the rows that most need the probe are the ones a heartbeat
+	 * test rejects. Cost per tick: one readdir plus a read per pending request
+	 * per distinct candidate channel, memoized across rows. */
+	private refreshWaits(now: number): void {
+		this.waits.clear();
+		this.waitDirs.clear();
+		// Memoized by channel identity, not by row: twins share a probe, and a
+		// candidate already found empty is not re-read for the next row.
+		const probed = new Map<string, SupervisorWait | undefined>();
+		for (const row of this.rows) {
+			if (row.state !== "running") continue;
+			// The run's own channel first, the inherited child's as a fallback:
+			// a revived run launches under its own id and keeps the original's
+			// session file, so the two disagree. Ownership is decided by which
+			// candidate ANSWERS — directory existence cannot decide it, because
+			// upstream collects empty channels after 60s and the revival's own
+			// directory is empty until it asks something.
+			const candidates = supervisorChannels(row.runId, row.stepIndex, row.sessionFile, row.agentName);
+			// An unexpired ask outranks an expired one from an earlier candidate:
+			// first-yield-wins let a timed-out leftover on the revival's own
+			// channel stop the probe before the inherited channel holding the
+			// conversation's LIVE question was ever read — a parked child with
+			// no surface showing it. Candidate order still breaks ties.
+			let chosenKey: string | undefined;
+			let chosenWait: SupervisorWait | undefined;
+			for (const candidate of candidates) {
+				const key = AgentHubComponent.channelKey(candidate);
+				if (!probed.has(key)) probed.set(key, readSupervisorWait(candidate, now));
+				const wait = probed.get(key);
+				if (wait === undefined) continue;
+				if (chosenWait === undefined || (waitExpired(chosenWait, now) && !waitExpired(wait, now))) {
+					chosenKey = key;
+					chosenWait = wait;
+				}
+				if (!waitExpired(chosenWait, now)) break;
+			}
+			// Mapped ONLY when something was found. A row with no wait anywhere
+			// used to key itself by its first candidate — a phantom naming
+			// nothing — and every consumer of the map then had to know that;
+			// the strip did not, and merged distinct children through it.
+			if (chosenKey !== undefined && chosenWait !== undefined) {
+				this.waits.set(chosenKey, chosenWait);
+				this.waitDirs.set(rowKey(row), chosenKey);
+			}
+		}
+	}
+
+	/** What this child is parked on, if anything. */
+	private waitFor(row: RunRow): SupervisorWait | undefined {
+		const dir = this.waitDirs.get(rowKey(row));
+		return dir !== undefined ? this.waits.get(dir) : undefined;
+	}
+
+	/** What can honestly be said about a running row. Silence is not death when
+	 * the child has declared why it is silent: a park carries its own clock
+	 * (600s, written into the request), which is the instrument here — the
+	 * 120s heartbeat rule only means anything for a child with no declared
+	 * reason to be quiet. Past the ask's deadline nothing is knowable from
+	 * silence alone, because the heartbeat froze *because of* the park: that
+	 * says unknown, not dead. */
+	private liveness(row: RunRow, now: number): "live" | "parked" | "unknown" | "stale" | "ended" {
+		// Its own value, not a borrowed "live". Returning "live" for a finished
+		// row made every caller responsible for re-checking `state` first, and
+		// the one that forgot — the strip — headlined "⟳ 7 running" one column
+		// away from six ✓/✗ glyphs.
+		if (row.state !== "running") return "ended";
+		const wait = this.waitFor(row);
+		// A heartbeat that moved after the ask expired proves the child gave up
+		// waiting and went back to work.
+		if (wait) return !waitExpired(wait, now) ? "parked" : isStale(row, now) ? "unknown" : "live";
+		// Upstream's own flag, for the runs whose channel this process cannot
+		// resolve. It carries no deadline, so a frozen heartbeat under it is the
+		// same unknown.
+		if (row.needsAttention) return isStale(row, now) ? "unknown" : "parked";
+		return isStale(row, now) ? "stale" : "live";
+	}
+
+	/** Possibly alive: everything but a finished run and one whose record cannot
+	 * be trusted. Steering one of these is safe (it queues); reviving one is not. */
+	private maybeLive(row: RunRow, now: number): boolean {
+		const liveness = this.liveness(row, now);
+		return liveness !== "stale" && liveness !== "ended";
+	}
+
+	/** How long this row has been quiet, or that nothing was ever recorded. An
+	 * absent heartbeat is not a heartbeat at time zero: printing the age of the
+	 * epoch ("no answer for 496339h55m") is precisely the invented measurement
+	 * the unknown verdict exists to refuse. */
+	private quietLabel(row: RunRow, now: number): string {
+		const beat = lastBeat(row, now);
+		return beat > 0 ? `no answer for ${formatDuration(now - beat)}` : "no answer · no heartbeat recorded";
+	}
+
 	private refreshRuns(): void {
 		if (this.disposed) return;
 		this.rows = scanRuns(asyncRunsRoot(), this.scanCache).filter(row => this.inScope(row)).slice(0, MAX_ROWS);
@@ -301,7 +412,12 @@ export class AgentHubComponent {
 			if (row?.sessionFile && this.tail?.filePath !== row.sessionFile) this.attachTail(row);
 		}
 		const now = Date.now();
-		const signature = `${this.scope}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.lastUpdate}|${row.currentTool}|${isStale(row, now)}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
+		this.refreshWaits(now);
+		// A child parking on a supervisor reply changes nothing else about the
+		// run — same state, same heartbeat — so the wait belongs in the
+		// signature or the row would keep its old label until something else
+		// moved.
+		const signature = `${this.scope}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.detached}|${this.liveness(row, now)}|${this.waitFor(row)?.requestId}|${row.lastUpdate}|${row.currentTool}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
 		if (signature !== this.lastSignature) {
 			this.lastSignature = signature;
 			this.tui.requestRender();
@@ -419,7 +535,7 @@ export class AgentHubComponent {
 	private pollLiveOutput(): void {
 		const row = this.selectedRow();
 		const now = Date.now();
-		const live = row !== undefined && row.state === "running" && !isStale(row, now) && this.follow;
+		const live = row !== undefined && this.maybeLive(row, now) && this.follow;
 		if (!live) {
 			if (this.liveOutput !== undefined) {
 				this.liveOutput = undefined;
@@ -519,11 +635,14 @@ export class AgentHubComponent {
 		return row.sessionId === this.rpc.sessionId;
 	}
 
-	/** Which channel a message to this run takes. A fresh running run can be
-	 * steered; anything else — finished, failed, or recorded running by a
-	 * parent that died — is a resume, which revives the child. */
+	/** Which channel a message to this run takes. A live STEP can be steered;
+	 * anything else — finished, failed, or recorded running by a parent that
+	 * died — is a resume, which revives the child. Judging this by the run's
+	 * state offered to *revive* children that were still running under an
+	 * ended run record, which is the one thing upstream tells callers never to
+	 * do while a detached child may still be live. */
 	private channelFor(row: RunRow, now: number): "steer" | "resume" {
-		return row.state === "running" && !isStale(row, now) ? "steer" : "resume";
+		return this.maybeLive(row, now) ? "steer" : "resume";
 	}
 
 	/** Synchronous acceptance check: true means the message is on its way and
@@ -552,6 +671,11 @@ export class AgentHubComponent {
 		const owns = this.ownsRun(row);
 		if (this.channelFor(row, Date.now()) === "steer") {
 			const live = runnerReachable(readCapability(row.dir, row.stepIndex)) && !steerInboxClosed(row.dir);
+			// Read once, above the ownership split: a parked child cannot take a
+			// message on EITHER channel, and fixing only the bridge path left the
+			// foreign-session path promising delivery one keypress after the same
+			// row said to answer in the conversation.
+			const parked = this.liveness(row, Date.now()) === "parked";
 			if (owns === false) {
 				// The bridge will refuse a foreign run; its runner's file inbox
 				// is the sanctioned cross-process channel when one is alive.
@@ -559,7 +683,9 @@ export class AgentHubComponent {
 					try {
 						const requestId = writeSteerRequestFile(row.dir, text, row.stepIndex);
 						this.ackWatch = { runKey: key, agent: row.agent, runDir: row.dir, index: row.stepIndex, requestId, sentAt: Date.now() };
-						this.setNotice("dropped in the runner's inbox — waiting for the ack…", "info", key);
+						this.setNotice(parked
+							? "in the runner's inbox — the child reads it once you answer the supervisor"
+							: "dropped in the runner's inbox — waiting for the ack…", "info", key);
 					} catch (error) {
 						this.setNotice(error instanceof Error ? error.message : String(error), "error", key);
 					}
@@ -571,15 +697,23 @@ export class AgentHubComponent {
 			const outcome = await this.rpc.steer(target, text);
 			if (this.disposed) return;
 			if (outcome.ok) {
-				if (live) {
+				if (parked) {
+					// The bridge accepted it, and the child cannot read it: it is
+					// blocked in a poll for a supervisor reply, not between turns.
+					// Claiming between-turn delivery here contradicted the same
+					// row's own action line one keypress earlier.
+					this.setNotice("accepted · the child is parked on a supervisor reply and reads this only once you answer", "info", key);
+				} else if (live) {
 					// No ack watch on this path: the owning extension consumes ack
 					// files itself (read-and-delete), so a watcher here races the
 					// owner and loses — delivery shows up as the child reacting.
 					this.setNotice("steering — the runner delivers it between turns", "success", key);
 				} else {
 					// Honest label for the attached case: the inbox holds it, and
-					// nothing reads that inbox until the run is resumed.
-					this.setNotice("accepted · parked — delivers when this run is resumed", "info", key);
+					// nothing reads that inbox until the run is resumed. Worded
+					// away from "parked", which now means a specific other thing
+					// one row above — a child blocked on a supervisor reply.
+					this.setNotice("accepted · queued in the run's inbox — delivers when this run is resumed", "info", key);
 				}
 			} else if (outcome.unreachable && live) {
 				// No bridge in this pi, but a live detached runner owns the run:
@@ -1124,7 +1258,31 @@ export class AgentHubComponent {
 		// pi session this user has run. The active count comes from the
 		// subagents bridge, which reports only the session we are inside,
 		// foreground delegations included.
-		const running = this.rows.filter(row => row.state === "running" && !isStale(row, now)).length;
+		// A parked child counts as running — it is alive and it is this
+		// session's work — but it is counted AGAIN under its own heading,
+		// because a roster of five where one is parked is a different
+		// situation from five that are working.
+		//
+		// Every count dedupes by child, not by row, and the identity is the
+		// SESSION FILE — the one artifact a revival and its original actually
+		// share. Never the chosen channel key, which depends on wait discovery:
+		// keyed by channel, the headline flapped "2 running" ↔ "1 waiting" as
+		// one child parked and unparked, and two distinct children whose dirs
+		// recorded one runId merged while working and split once parked.
+		const runningChildren = new Set<string>();
+		const parkedChildren = new Set<string>();
+		const unknownChildren = new Set<string>();
+		for (const row of this.rows) {
+			const liveness = this.liveness(row, now);
+			const child = row.sessionFile ?? rowKey(row);
+			if (liveness === "unknown") unknownChildren.add(child);
+			if (liveness !== "live" && liveness !== "parked") continue;
+			runningChildren.add(child);
+			if (liveness === "parked") parkedChildren.add(child);
+		}
+		const running = runningChildren.size;
+		const waiting = parkedChildren.size;
+		const unknown = unknownChildren.size;
 		// Foreign numbers deserve the same suspicion as foreign strings: a
 		// string total concatenates instead of adding, Infinity renders as
 		// "InfinityK tok".
@@ -1164,7 +1322,13 @@ export class AgentHubComponent {
 				? dim("session not identified yet")
 				: running > 0
 					? this.theme.fg("warning", `⟳ ${running} running`)
-					: dim("No agents running"),
+					// "No agents running" is a claim of absence, and it must not
+					// be made over rows the same frame calls unknown.
+					: unknown > 0
+						? dim("no agents confirmed running")
+						: dim("No agents running"),
+			...(!sessionUnknown && waiting > 0 ? [this.theme.fg("accent", `! ${waiting} waiting on you`)] : []),
+			...(!sessionUnknown && unknown > 0 ? [dim(`? ${unknown} unknown`)] : []),
 			sessionUnknown ? dim("r retries · f scope") : dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} ${scopeLabel} · f scope`),
 			...(!sessionUnknown && scopeCost > 0 ? [dim(`${formatCost(scopeCost)}${scopeCostComplete ? "" : "…"}`)] : []),
 			!this.rpcInfo.available
@@ -1264,7 +1428,27 @@ export class AgentHubComponent {
 			if (this.ownsRun(row) === false && !(channel === "steer" && this.cachedRunnerProbe(row, now))) {
 				return dim("view-only · launched by another pi session · o cwd · y copy path");
 			}
-			const explain = channel === "steer" ? "s steers the running child" : row.state === "running" ? "s revives this stalled run" : "s resumes the conversation";
+			// A parked child is not reading its steer inbox — it is blocked in a
+			// poll for the reply file. Saying "s steers the running child" there
+			// promises delivery to something that cannot take it until the
+			// conversation answers; the answer is a tool call this hub does not
+			// make, so the row says where the reply belongs. The keys stay
+			// advertised: they all still work, and this was the only row that
+			// stopped naming them.
+			if (this.liveness(row, now) === "parked") {
+				// The question, not the enum: `reason` is a token like
+				// "interview_request", while `message` is what was actually
+				// asked — and the message was being read, bounded and dropped.
+				const wait = this.waitFor(row);
+				const asked = sanitizeLine(wait?.message || wait?.reason || "");
+				const quoted = asked ? ` — “${asked}”` : "";
+				return dim(`parked: answer in the conversation${quoted} · i interrupt · D stop · o cwd · y copy path`);
+			}
+			// "the running child" is a claim, and after an ask ran out with the
+			// heartbeat frozen it is exactly the claim nothing supports.
+			const explain = this.liveness(row, now) === "unknown"
+				? `s sends · ${this.quietLabel(row, now)}`
+				: channel === "steer" ? "s steers the running child" : row.state === "running" ? "s revives this stalled run" : "s resumes the conversation";
 			return dim(`${explain} · i interrupt · D stop · o cwd · y copy path`);
 		}
 		return dim("no run selected");
@@ -1285,11 +1469,46 @@ export class AgentHubComponent {
 	}
 
 	private stateGlyph(row: RunRow, now: number): string {
-		if (isStale(row, now)) return this.theme.fg("muted", "⟳");
-		if (row.state === "running") return this.theme.fg("warning", "⟳");
-		if (row.state === "complete") return this.theme.fg("success", "✓");
-		if (row.state === "failed") return this.theme.fg("error", "✗");
-		return this.theme.fg("muted", "■");
+		if (row.state !== "running") {
+			if (row.state === "complete") return this.theme.fg("success", "✓");
+			if (row.state === "failed") return this.theme.fg("error", "✗");
+			return this.theme.fg("muted", "■");
+		}
+		// A parked child reads as running everywhere else — same state, same
+		// recorded status — and the whole point of the row is that it is not
+		// going to move until someone answers it. Its own glyph, not a tint.
+		switch (this.liveness(row, now)) {
+			case "parked": return this.theme.fg("accent", "!");
+			case "unknown": return this.theme.fg("muted", "?");
+			case "stale": return this.theme.fg("muted", "⟳");
+			default: return this.theme.fg("warning", "⟳");
+		}
+	}
+
+	/** The row's state in words. Live rows say what is holding them: parked on
+	 * a supervisor reply, detached from an ended run record, or the tool they
+	 * are inside. Each of these was previously rendered as the run's own
+	 * outcome, which is how a working child came to be labelled "failed". */
+	private stateLabel(row: RunRow, now: number): string {
+		if (row.state !== "running") return row.state;
+		const detached = row.detached ? " · detached" : "";
+		switch (this.liveness(row, now)) {
+			case "parked": return `waiting on you${detached}`;
+			// Neither "stale" nor "waiting" is knowable here: the ask ran out
+			// and the heartbeat froze *because of* the ask, so it is evidence
+			// of nothing. Say how long it has been quiet and let the reader
+			// judge — asserting either would be inventing a measurement.
+			case "unknown": return `${this.quietLabel(row, now)}${detached}`;
+			case "stale": return "stale";
+			default: return `${row.currentTool ?? "…"}${detached}`;
+		}
+	}
+
+	/** The same verdict for the chat header, where the current tool is already
+	 * on screen below and the word the reader needs is the state itself. */
+	private headerLabel(row: RunRow, now: number): string {
+		if (row.state !== "running" || this.liveness(row, now) !== "live") return this.stateLabel(row, now);
+		return row.detached ? "running · detached" : "running";
 	}
 
 	private renderList(width: number, fullHeight: number, now: number): string[] {
@@ -1318,7 +1537,6 @@ export class AgentHubComponent {
 			const row = this.rows[index]!;
 			const selected = index === selectedIndex;
 			const marker = selected ? this.theme.fg("accent", "▸") : " ";
-			const stale = isStale(row, now);
 			// Agent, tool, state and model strings come from another extension's
 			// status.json — from names a model may have picked. A control byte
 			// there clears the user's screen mid-frame; strip before drawing.
@@ -1336,7 +1554,7 @@ export class AgentHubComponent {
 			const gap = Math.max(1, width - 3 - visibleWidth(nameShown) - visibleWidth(right));
 			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${nameShown}${" ".repeat(gap)}${rightStyled}`, width));
 
-			const detail = sanitizeLine(stale ? "stale" : row.state === "running" ? (row.currentTool ?? "…") : row.state);
+			const detail = sanitizeLine(this.stateLabel(row, now));
 			const step = row.stepCount > 1 ? `#${row.stepIndex} · ` : "";
 			const active = row.startedAt !== undefined ? formatDuration((row.lastActivityAt ?? row.lastUpdate ?? row.startedAt) - row.startedAt) : "";
 			const meter = this.usageFor(row.sessionFile);
@@ -1399,8 +1617,7 @@ export class AgentHubComponent {
 		// The same verdict the list row shows. Interpolating the recorded state
 		// raw claimed "running" for a run whose heartbeat had stopped, one
 		// column away from a row already calling it stale.
-		const stale = isStale(row, now);
-		const state = sanitizeLine(stale ? "stale" : row.state);
+		const state = sanitizeLine(this.headerLabel(row, now));
 		const meter = this.usageFor(row.sessionFile);
 		const usage = meter && (meter.done || meter.totals.cost > 0)
 			? ` · ${formatCost(meter.totals.cost)}${meter.done ? "" : "…"} · ${formatTokens(meter.totals.tokens)} tok`
@@ -1410,7 +1627,7 @@ export class AgentHubComponent {
 		this.lastPaneHeight = paneHeight;
 		// One row is reserved for the scroll indicator, and a block for the live
 		// output tail — reserved, not overwritten, so neither costs content.
-		const liveLines = this.follow && !stale && row.state === "running" ? (this.liveOutput?.lines ?? []) : [];
+		const liveLines = this.follow && this.maybeLive(row, now) ? (this.liveOutput?.lines ?? []) : [];
 		const reserved = (this.chatScroll > 0 ? 1 : 0) + (liveLines.length > 0 ? liveLines.length + 1 : 0);
 		const viewHeight = Math.max(1, paneHeight - reserved);
 		this.lastChatHeight = viewHeight;
@@ -1456,7 +1673,10 @@ export class AgentHubComponent {
 			}
 			body.push(...this.chatMemo!.lines);
 			if (this.chatMemo!.lines.length === 0) {
-				body.push(dim(stale ? "no conversation recorded — s revives this run" : "no conversation recorded yet"));
+				// Offer the revive only where `s` actually revives: a parked or
+				// merely quiet child is alive, and telling the reader to revive
+				// one is the same lie the row above no longer tells.
+				body.push(dim(this.maybeLive(row, now) ? "no conversation recorded yet" : "no conversation recorded — s revives this run"));
 			}
 		}
 
@@ -1482,5 +1702,7 @@ export class AgentHubComponent {
 		if (this.tailTimer) clearInterval(this.tailTimer);
 		this.offRunEvents();
 		this.rpc.dispose();
+		this.waits.clear();
+		this.waitDirs.clear();
 	}
 }

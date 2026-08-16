@@ -8,16 +8,65 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+/** What a row IS, in one vocabulary. Upstream spells the same outcome two
+ * ways depending on where it is written ("complete" at run level, "completed"
+ * on a step), and only steps carry "pending"/"rejected". */
+export type RowState = "pending" | "running" | "complete" | "failed" | "stopped" | "paused" | "rejected" | "unknown";
+
+const ROW_STATES: Record<string, RowState> = {
+	pending: "pending",
+	queued: "pending",
+	running: "running",
+	complete: "complete",
+	completed: "complete",
+	failed: "failed",
+	stopped: "stopped",
+	paused: "paused",
+	rejected: "rejected",
+};
+
+/** Run-level states that mean the run record is over. A step still reporting
+ * "running" under one of these is not finished — it is detached (see below). */
+const RUN_OVER = new Set<RowState>(["complete", "failed", "stopped", "rejected"]);
+
+/** `hasOwn` is load-bearing: a plain object literal answers for its prototype
+ * too, so a step whose status reads "constructor" or "toString" returned a
+ * FUNCTION as this row's state. That value reached `sanitizeLine` at the render
+ * site and threw `line.replace is not a function` out of render — the host
+ * session, killed by one word in a foreign file (invariant 1, invariant 7). */
+function normalizeState(raw: string | undefined): RowState | undefined {
+	return raw !== undefined && Object.hasOwn(ROW_STATES, raw) ? ROW_STATES[raw] : undefined;
+}
+
 /** One selectable row: a single step of an async run. */
 export interface RunRow {
 	runId: string;
 	stepIndex: number;
 	stepCount: number;
 	agent: string;
+	/** The step's agent name as recorded, with no display fallback. Identity,
+	 * not a label: the supervisor channel is keyed by the real launch name, so
+	 * matching a channel against `agent` (which falls back to the step label
+	 * and then to "agent") would reject a wait that belongs to this row. */
+	agentName?: string;
 	/** Which pi session launched the run — control is session-scoped upstream. */
 	sessionId?: string;
+	/** What this row is, derived from the STEP and only then from the run. A
+	 * row is a step, and the two disagree routinely: an intercom detach ends
+	 * the run record as "failed" while its child keeps working, and one failed
+	 * step of five leaves the run "complete". Every display and every gate
+	 * reads this; `runState` is kept for the record, not for labels. */
+	state: RowState;
 	/** Run-level state as recorded ("running" | "complete" | "failed" | …). */
-	state: string;
+	runState: string;
+	/** This step is running under a run record that has already ended — what an
+	 * intercom detach leaves behind. The child outlives its run: still writing,
+	 * still costing money, no longer owned by the run's own lifecycle. */
+	detached: boolean;
+	/** Upstream's own "this child is blocked on someone" flag. Only runner-
+	 * hosted runs ever set it, so its absence proves nothing — the supervisor
+	 * channel is the signal that works for parent-hosted runs. */
+	needsAttention: boolean;
 	stepStatus: string;
 	model?: string;
 	thinking?: string;
@@ -44,28 +93,88 @@ export const MAX_ROWS = 50;
  * reported as stale. */
 export const STALE_RUNNING_MS = 120_000;
 
-export function isStale(row: RunRow, now: number): boolean {
-	return row.state === "running" && now - (row.lastUpdate ?? 0) > STALE_RUNNING_MS;
+/** The freshest proof this STEP is alive. Step activity first: a run's
+ * `lastUpdate` moves whenever any of its steps writes, so judging a step by it
+ * lets a live sibling vouch for a dead one. Falling back the other way is
+ * safe — a step that has not reported activity yet has only the run's clock.
+ * The fallback is also taken when the step's own stamp is unbelievable, which
+ * does re-admit sibling vouching for that one case: a stamp from the future is
+ * no evidence at all, and the run's clock is worse evidence than the step's but
+ * better than none.
+ *
+ * A stamp from the future gets two different treatments because it has two
+ * different causes. Within tolerance it is clock skew between the writer and
+ * this process, and the child really is that fresh — clamping to `now` is
+ * right. Beyond it, the number is not a time this machine can believe, and the
+ * honest reading is that there is NO beat, not the freshest possible one:
+ * clamping alone turned the age from negative to zero, which is just as
+ * unfalsifiable, and the row became immortal — never stale, never dropped,
+ * re-probed every tick forever. */
+const CLOCK_SKEW_TOLERANCE_MS = 5_000;
+
+export function lastBeat(row: RunRow, now: number): number {
+	// An unbelievable stamp means ask the next witness, not assume death.
+	// Vetoing the first candidate outright let one bad number — or a backward
+	// clock step, which makes EVERY recent stamp look future-dated at once —
+	// mark live children stale in bulk, which also switches off the supervisor
+	// probe (it skips stale rows) and offers to revive running children.
+	for (const candidate of [row.lastActivityAt, row.lastUpdate, row.startedAt]) {
+		if (candidate === undefined) continue;
+		if (candidate > now + CLOCK_SKEW_TOLERANCE_MS) continue;
+		return Math.min(candidate, now);
+	}
+	return 0;
 }
 
-/** The temp scope the foreign extension namespaces its artifacts under —
- * uid-keyed on anything POSIX, mirroring its own resolution. The home fallback
- * approximates the original's sanitizer; on this platform the uid branch is
- * the one that runs. */
+export function isStale(row: RunRow, now: number): boolean {
+	return row.state === "running" && now - lastBeat(row, now) > STALE_RUNNING_MS;
+}
+
+/** The temp scope the foreign extension namespaces its artifacts under,
+ * mirroring upstream's `resolveTempScopeId` (shared/types.ts) TIER FOR TIER.
+ * An "approximation" here is a different directory, and a different directory
+ * is the whole extension silently inert: the earlier version skipped the
+ * `user-` tier entirely, so on Windows — where `getuid` is undefined and
+ * `USERNAME` is always set — upstream lands on `user-<name>` while the hub
+ * landed on `home-<path>`, every scan returned empty, and nothing errored. */
+function sanitizeTempScopeSegment(value: string): string {
+	const sanitized = value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+	return sanitized || "unknown";
+}
+
 function tempScopeId(): string {
-	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-	if (uid !== undefined && uid >= 0) return `uid-${uid}`;
+	// Presence of the function, not its value: upstream keys on any uid the
+	// platform reports, including one a `>= 0` guard would have rejected.
+	if (typeof process.getuid === "function") return `uid-${process.getuid()}`;
+	for (const key of ["USERNAME", "USER", "LOGNAME"] as const) {
+		const value = process.env[key];
+		if (value) return `user-${sanitizeTempScopeSegment(value)}`;
+	}
 	try {
-		const home = os.homedir();
-		if (home) return `home-${home.replace(/[^a-zA-Z0-9._-]+/g, "-")}`;
+		const username = os.userInfo().username;
+		if (username) return `user-${sanitizeTempScopeSegment(username)}`;
 	} catch {
-		// Fall through to the shared scope.
+		// Fall through to home-directory-based scoping.
+	}
+	const homedir = process.env.USERPROFILE ?? process.env.HOME;
+	if (homedir) return `home-${sanitizeTempScopeSegment(homedir)}`;
+	try {
+		const fallback = os.homedir();
+		if (fallback) return `home-${sanitizeTempScopeSegment(fallback)}`;
+	} catch {
+		// Fall through to the last-resort shared scope.
 	}
 	return "shared";
 }
 
+/** The foreign extension's temp root. Every artifact family it publishes —
+ * run dirs, results, supervisor channels — hangs off this one directory. */
+export function tempRoot(): string {
+	return path.join(os.tmpdir(), `pi-subagents-${tempScopeId()}`);
+}
+
 export function asyncRunsRoot(): string {
-	return path.join(os.tmpdir(), `pi-subagents-${tempScopeId()}`, "async-subagent-runs");
+	return path.join(tempRoot(), "async-subagent-runs");
 }
 
 interface CacheEntry {
@@ -86,23 +195,52 @@ function asNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+
 function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 	if (typeof raw !== "object" || raw === null) return [];
 	const status = raw as Record<string, unknown>;
 	const runId = asString(status.runId) ?? path.basename(dir);
 	const steps = Array.isArray(status.steps) && status.steps.length > 0 ? status.steps : [{}];
 	const rows: RunRow[] = [];
+	const runState = asString(status.state) ?? "unknown";
+	// `> 0`, not merely present: a zero or negative endedAt is not an ending,
+	// and treating it as one marked a plainly running run detached.
+	const runOver = RUN_OVER.has(normalizeState(runState) ?? "unknown") || (asNumber(status.endedAt) ?? 0) > 0;
 	for (let index = 0; index < steps.length; index++) {
 		const step = (typeof steps[index] === "object" && steps[index] !== null ? steps[index] : {}) as Record<string, unknown>;
 		const sessionFile = asString(step.sessionFile);
+		// Presence, not parseability: `asString` answers undefined for a number,
+		// a null, an object AND the empty string, so judging absence by it let a
+		// step that HAS a status — just not a readable one — borrow the run's
+		// answer, which is the exact substitution the comment below forbids.
+		// A JSON null counts as present: upstream's type makes `status` required
+		// and non-null, so a null there is a writer that emitted something which
+		// is not a status — malformed, not absent, and malformed must not
+		// inherit the run's answer.
+		const hasStatus = step.status !== undefined;
+		const rawStatus = asString(step.status);
+		const stepStatus = rawStatus ?? "unknown";
+		// The step's own word, and only if it has NO word does the run speak
+		// for it: a status.json written before any step exists carries the
+		// run's state alone, and that is the one case where it is also the
+		// step's. A step status this version does not know stays unknown —
+		// borrowing the run's answer there is how a row comes to claim a state
+		// nothing measured.
+		const state = hasStatus
+			? normalizeState(rawStatus) ?? "unknown"
+			: normalizeState(runState) ?? "unknown";
 		rows.push({
 			runId,
 			stepIndex: index,
 			stepCount: steps.length,
 			agent: asString(step.agent) ?? asString(step.label) ?? "agent",
+			agentName: asString(step.agent),
 			sessionId: asString(status.sessionId),
-			state: asString(status.state) ?? "unknown",
-			stepStatus: asString(step.status) ?? "unknown",
+			state,
+			runState,
+			detached: state === "running" && runOver,
+			needsAttention: asString(step.activityState) === "needs_attention",
+			stepStatus,
 			model: asString(step.model),
 			thinking: asString(step.thinking),
 			mode: asString(status.mode),
@@ -164,8 +302,17 @@ export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunR
 	}
 	for (const key of cache.keys()) if (!seen.has(key)) cache.delete(key);
 
-	const kept = all.filter(row => row.sessionFileExists || (row.state === "running" && now - (row.lastUpdate ?? 0) < STALE_RUNNING_MS));
-	kept.sort((a, b) => (b.lastUpdate ?? b.startedAt ?? 0) - (a.lastUpdate ?? a.startedAt ?? 0));
+	// Judged by the same clock `isStale` uses. While this read the run's
+	// `lastUpdate` and staleness read the step's, a row this module's own rule
+	// called fresh could be dropped from the scan entirely — no label, glyph or
+	// counter downstream can rescue a row that never arrives.
+	const kept = all.filter(row => row.sessionFileExists || (row.state === "running" && now - lastBeat(row, now) < STALE_RUNNING_MS));
+	// Ranked by the same clock the filter and staleness use. Ranking by the
+	// RUN's `lastUpdate` while judging freshness by the step's put the one row
+	// this list exists to surface — a detached child still writing under a run
+	// record that stopped moving 40 minutes ago — behind every finished run,
+	// and the caller's MAX_ROWS cut it off the list entirely.
+	kept.sort((a, b) => lastBeat(b, now) - lastBeat(a, now));
 	// Uncapped: the display bound belongs to the caller, after its scope
 	// filter — capping here let newer runs from other projects push a
 	// project's own runs out of the project view.

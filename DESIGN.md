@@ -59,6 +59,132 @@ writer (verified upstream; see nicobailon/pi-subagents#1019).
   will shift — one more reason everything gates on the `ready` manifest's
   capabilities rather than assumptions.
 
+### A run's state is not its step's state (2026-08-15, caught live)
+
+- **The run record and the child disagree routinely, and the child is right.**
+  Observed on a live `dp-worker`: `status.json` carried `state: "failed"`,
+  `endedAt` 188s old and `error: "Detached for intercom coordination…"`, while
+  its step 0 carried `status: "running"`, `lastActivityAt` 0.2s old, a rising
+  `turnCount`, and a live pid. The RPC fleet agreed with the step — it counts
+  `activeState(step.status)` — so the panel's own strip contradicted its own
+  row. A row IS a step; it takes the step's status, and the run's only when a
+  step has none. The inverse case is on disk too: run `complete` with steps
+  `[completed, completed, failed, completed, completed]`.
+- **Detach is the mechanism.** `contact_supervisor` detaches the child for
+  intercom coordination; the wrapper run then ends while the child keeps
+  working, costing money, owned by nothing. Upstream's own text says never to
+  `resume` one while it may still be live — which is exactly what the hub
+  offered while it judged liveness by run state.
+- **Vocabularies differ by writer**: run level says `complete`, a step says
+  `completed`; `pending`/`rejected` are step-only. One normalization
+  (`RowState`), and an unrecognized step status stays `unknown` rather than
+  borrowing the run's answer.
+- **Staleness belongs to the step.** A run's `lastUpdate` moves when *any* of
+  its steps writes, so judging a step by it lets a live sibling vouch for a
+  dead one; `lastActivityAt` first, the run's clock only as fallback.
+
+### The supervisor channel (how "waiting on you" is knowable)
+
+- `supervisor-channels/<childRunId>-<agent>-<childIndex>/{requests,replies}/<id>.json`
+  under the same temp root. The child writes a request and blocks polling for
+  the reply file, so **a request with no reply beside it is a parked child** —
+  the only signal that works, because `activityState: "needs_attention"` is
+  written by the runner path and a parent-hosted run never gets it.
+- The key is the **child's own** run id and index, not the async run's id or
+  the step's position (step 2 of a run is child 0 of its own). Both are
+  recoverable from the one artifact that names the child: its session file,
+  `…/<childRunId>/run-<childIndex>/session.jsonl`. The agent segment is
+  sanitized by upstream's rule (`[^A-Za-z0-9._-]+` → `-`), mirrored exactly —
+  divergence there silently probes a path that never exists and reports calm.
+- **Read-only, and it stays that way.** Answering is the parent's tool call; a
+  reply written from the hub would race the extension's watcher for a request
+  it may already have taken.
+- **Empty channels are garbage-collected after 60s**
+  (`STALE_EMPTY_CHANNEL_AGE_MS`, swept on the 250ms watcher poll). Directory
+  existence therefore cannot carry ownership: a revived run's own channel is
+  created empty at spawn and is gone a minute later unless the child asks
+  something. Every channel observed on this machine is non-empty — that is the
+  population GC leaves. Candidate channels are arbitrated by which one YIELDS a
+  wait passing `belongsTo`, never by which directory exists.
+- **A run-id-keyed channel is indexed by the child's position in the run**
+  (upstream's `flatIndex`), while the session path always reads `run-0` —
+  every child gets a fresh session root. Borrowing the path's zero for the
+  run-id candidate collapsed every same-agent sibling of a fan-out onto one
+  channel; the step's own index is the correct key there.
+
+### Recorded assumptions the channel probe rests on (round-5 findings)
+
+- **A run's recorded id is never another row's child-session segment.** If it
+  were, that row's session-derived candidate and the run's run-id candidate
+  would be the *same identity tuple* — same dir, same raw ids — and
+  `belongsTo` is structurally unable to tell the rows apart: one child's
+  question would render under both. Holds on every artifact observed (the one
+  real revival, `207f8b12`, revives `2b77de68` — distinct); unenforceable from
+  the hub's side. The prefer-unexpired selection widens this assumption's
+  blast radius: under the collision, a row's own *expired* ask is displaced by
+  the other child's live one, so the row claims "waiting on you" quoting a
+  question its child never asked, where it would otherwise have said
+  "no answer for Xm". Same unobserved precondition; larger wrong claim.
+- **No running step ever sits after an unexpanded dynamic-fanout group.**
+  Upstream splices the steps array mid-run (dynamic fanout, 1 step → N),
+  shifting later flat indexes; a running step whose index shifted would probe
+  a channel keyed by its old position and report calm. Sequential chains
+  cannot produce it (later steps have not launched); parallel arrangements
+  were not observable. Upstream's invariant, not the hub's.
+- **Only `expectsReply` requests are waits.** `reason: "progress_update"` sets
+  `expectsReply: false`, and the child returns without blocking — its request
+  file sits in the same directory and means nobody is waiting. Reporting those
+  as parked labelled a working child "waiting on you"; in a run owned by
+  another pi session the file is never cleaned up, so the lie was permanent.
+- **A park carries its own clock**: `expiresAt = createdAt + 600_000` on the
+  real envelope. Past it the child's poll has thrown and it has moved on.
+- **The request file outlives the ask being taken.** Upstream keeps it while
+  the parent holds the request pending and deletes it as the reply is written,
+  so on every answered channel observed `requests/` is empty. A lingering
+  request therefore means *parked or dead* — never *answered*.
+
+### Silence is not death when the child said why (the rule the round produced)
+
+The 120s heartbeat rule only means anything for a child with **no declared
+reason to be quiet**. A parked child stops emitting activity *because* it is
+blocked, so judging it by `lastBeat` marked it stale exactly when it was most
+certainly alive — and the hub then offered to *revive* it, the one thing
+upstream forbids while a detached child may be live. Three-way instead:
+
+| evidence | verdict | shown |
+|---|---|---|
+| unexpired request pending (or upstream's `needs_attention` with a fresh beat) | **parked** | `!` · "waiting on you" · the question quoted |
+| ask expired, heartbeat moved since | **live** | the current tool |
+| ask expired, heartbeat still frozen | **unknown** | `?` · "no answer for 9m" |
+| no ask at all, beat older than 120s | **stale** | `⟳` muted · "stale" · revive offered |
+
+"Unknown" is the honest verdict in the third row and belongs to invariant 6:
+the heartbeat froze *because of* the park, so it is evidence of nothing, and
+both "stale" (asserting death, gating revive) and "waiting on you" (asserting
+a live child) would be measurements nobody took.
+
+**Waits are keyed by channel directory, not by row** — a revival row shares its
+original's session file and so its child's channel, and keying by row counted
+one parked child twice, the same double count `scopeMeters` already dedupes
+for money.
+
+### Known gaps in the probe (not reachable from local artifacts)
+
+- **Forked children.** With `context: "fork"` the child's session file is a
+  branched session in the parent's directory, not `<childRunId>/run-<N>/`, so
+  the channel is underivable and the probe reports calm. Every session file on
+  this machine is `run-0/session.jsonl`, so this is a code-read, unverified.
+- **Runner-hosted multi-step runs** may key the channel by the async run id and
+  flat index (`subagent-runner.ts`) rather than the child's own id and index
+  (`execution.ts`). All five channels on disk match the second shape, which is
+  what the hub derives; the first would never be found.
+- **The directory name cannot identify the child.** `sanitizeSegment` is
+  many-to-one (`[^A-Za-z0-9._-]+ → -`), so two children whose run ids or
+  model-chosen agent names differ only in punctuation ("twin A" / "twin-A")
+  resolve to one path — and one child's question renders on the other's row.
+  The request envelope names its own `runId`, `agent` and `childIndex`, so
+  attribution is checked against those, not against the path.
+
 ### What this means for typing
 
 Typing is real, but its semantics are per run state, and the composer must say

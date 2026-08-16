@@ -65,6 +65,17 @@ history.
    delivered vs queued vs parked vs view-only — and a notice about run A must
    never display under run B. When state can't be known, say unknown; never
    interpolate a recorded "running" the heartbeat contradicts (stale runs).
+   **A row is a step, so it wears the step's status** — the run-level state
+   describes the wrapper and disagrees with its child whenever an intercom
+   detach ends the record early or one step of five fails. Judging liveness by
+   the run painted a working child `✗ failed`, refused to interrupt it, and
+   offered to *revive* it while it was still running. **Silence is not death
+   when the child declared why it is silent**: a child parked on a supervisor
+   reply stops emitting activity *because* it is blocked, so a heartbeat test
+   condemns it precisely when it is most certainly alive. Measure a declared
+   wait against its own clock (the ask's `expiresAt`), and when that runs out
+   with the beat still frozen, say unknown — the freeze was caused by the park
+   and is evidence of nothing.
 7. **Files someone else writes are hostile at every boundary**: partial lines
    (keep remainders as *bytes*, copied — a `subarray` view pins the whole
    read), in-place rewrites that keep inode AND size growth (the 64-byte
@@ -92,6 +103,7 @@ history.
 | `src/rpc.ts` | client for pi-subagents' `subagents:rpc:v1:*` bridge |
 | `src/control-files.ts` | capability/ack readers + fallback inbox writers |
 | `src/output-tail.ts` | bounded sanitized tail of a run's output log; exports `sanitizeLine` |
+| `src/supervisor-channel.ts` | read-only probe of the intercom channel: is this child parked on a supervisor reply |
 | `src/settings.ts` | the hub's own settings file (panel size): defensive read, atomic write |
 
 ## Conventions
