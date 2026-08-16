@@ -67,6 +67,12 @@ export interface RunRow {
 	 * hosted runs ever set it, so its absence proves nothing — the supervisor
 	 * channel is the signal that works for parent-hosted runs. */
 	needsAttention: boolean;
+	/** Why this step ended the way it did, when it says. The step's own reason
+	 * ("Subagent completed without making edits for an implementation task")
+	 * answers the question a bare "failed" provokes; the run's reason is the
+	 * fallback and is usually about the wrapper, not the child. First line
+	 * only and bounded — a run-level error carries a whole stack trace. */
+	error?: string;
 	stepStatus: string;
 	model?: string;
 	thinking?: string;
@@ -195,6 +201,35 @@ function asNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** Enough of a reason to be worth a row, never enough to be a cost. Upstream's
+ * run-level errors arrive with a stack trace attached, so the first line is
+ * the whole signal and the rest is noise measured in kilobytes. */
+const MAX_ERROR_CHARS = 300;
+
+function asReason(value: unknown): string | undefined {
+	const text = asString(value);
+	if (text === undefined) return undefined;
+	const [first] = text.split("\n", 1);
+	const line = (first ?? "").trim().replace(/^(?:Error:\s*)+/, "");
+	if (!line) return undefined;
+	if (line.length <= MAX_ERROR_CHARS) return line;
+	// By code point, not code unit. A cut inside a surrogate pair renders one
+	// column wider than `visibleWidth` reports — the sibling module's `clip`
+	// carries this same rule, and slicing by units here reintroduced the exact
+	// defect it was fixed for. A code point is at most two units, so the first
+	// MAX points always live inside the first 2*MAX units.
+	// One code point past the bound, so the slice can PROVE which case this is:
+	// if the line had more than MAX points, its first MAX+1 occupy at most
+	// 2*(MAX+1) units and are therefore all inside this slice. Sampling exactly
+	// 2*MAX units instead cannot tell "exactly MAX points" from "far more", and
+	// returning the original line in that branch let an all-emoji reason escape
+	// the bound completely — 400 points rendered in full.
+	const points = Array.from(line.slice(0, MAX_ERROR_CHARS * 2 + 2));
+	// The ellipsis only when something was actually cut: saying the reason
+	// continues when the reader is looking at all of it is its own small lie.
+	if (points.length <= MAX_ERROR_CHARS) return line;
+	return `${points.slice(0, MAX_ERROR_CHARS).join("")}…`;
+}
 
 function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 	if (typeof raw !== "object" || raw === null) return [];
@@ -240,6 +275,12 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			runState,
 			detached: state === "running" && runOver,
 			needsAttention: asString(step.activityState) === "needs_attention",
+			// The run's reason speaks for a step ONLY when there is one step to
+			// speak for. Falling back for every step printed the wrapper's
+			// "Detached for intercom coordination" under all four healthy
+			// siblings of the one that failed — the same misattribution this
+			// whole changeset exists to end, one level down.
+			error: asReason(step.error) ?? (steps.length === 1 ? asReason(status.error) : undefined),
 			stepStatus,
 			model: asString(step.model),
 			thinking: asString(step.thinking),

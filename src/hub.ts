@@ -1623,7 +1623,26 @@ export class AgentHubComponent {
 			? ` · ${formatCost(meter.totals.cost)}${meter.done ? "" : "…"} · ${formatTokens(meter.totals.tokens)} tok`
 			: "";
 		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${row.model ? ` · ${sanitizeLine(row.model)}` : ""}${usage} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
-		const paneHeight = Math.max(1, height - 2);
+		// The reason under the verdict. A bare "failed" is the start of a
+		// question whose answer is already in the artifact — "completed without
+		// making edits for an implementation task" — and reading it should not
+		// mean opening a temp file. Only where it adds something: a running row
+		// wears its state, and a reason under it would be about the wrapper.
+		//
+		// Computed BEFORE the budget, because it spends a row of it. Taken out
+		// of the view afterwards instead, it ate the newest line of the
+		// conversation while `lastPaneHeight` and `lastChatHeight` still
+		// claimed the taller pane — the scroll indicator vanished, paging
+		// overshot by a line, and on a 3-row body the conversation left the
+		// screen entirely.
+		// Shed below four rows: the `Math.max(1, …)` floor cannot absorb the
+		// extra line, so keeping it there emitted one row more than the caller
+		// budgeted and the clip landed on the conversation instead. A reason
+		// with no conversation under it is not the trade to make.
+		const reason = row.state !== "running" && row.error !== undefined && height >= 4
+			? [truncateToWidth(dim(`why: ${sanitizeLine(row.error)}`), width)]
+			: [];
+		const paneHeight = Math.max(1, height - 2 - reason.length);
 		this.lastPaneHeight = paneHeight;
 		// One row is reserved for the scroll indicator, and a block for the live
 		// output tail — reserved, not overwritten, so neither costs content.
@@ -1689,7 +1708,7 @@ export class AgentHubComponent {
 			for (const line of liveLines) view.push(truncateToWidth(dim(line), width));
 		}
 		while (view.length < paneHeight) view.push("");
-		return [truncateToWidth(header, width), "", ...view.slice(0, paneHeight)];
+		return [truncateToWidth(header, width), ...reason, "", ...view.slice(0, paneHeight)];
 	}
 
 	invalidate(): void {
