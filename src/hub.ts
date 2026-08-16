@@ -957,20 +957,21 @@ export class AgentHubComponent {
 			this.done(undefined);
 			return;
 		}
-		// Reading owns the unshifted keys: j/k/u/d scroll the conversation,
-		// the constant activity; shift means "act on the roster instead" —
-		// J/K change the selection, as do the arrows.
+		// The roster owns the unshifted keys: j/k (and the arrows) move between
+		// agents, which is what the panel is for and what the hand reaches for
+		// first; shift means "act on the conversation instead" — J/K scroll the
+		// chat pane, alongside u/d, which keep their half-page motions.
 		const index = this.rows.findIndex(row => rowKey(row) === this.selectedKey);
-		if (data === "\x1b[A" || data === "K") {
+		if (data === "\x1b[A" || data === "k") {
 			if (index > 0) this.select(rowKey(this.rows[index - 1]!));
 			return;
 		}
-		if (data === "\x1b[B" || data === "J") {
+		if (data === "\x1b[B" || data === "j") {
 			if (index >= 0 && index < this.rows.length - 1) this.select(rowKey(this.rows[index + 1]!));
 			return;
 		}
-		if (data === "k") return this.scrollChat(1);
-		if (data === "j") return this.scrollChat(-1);
+		if (data === "K") return this.scrollChat(1);
+		if (data === "J") return this.scrollChat(-1);
 		// Half-page vim motions on plain u/d: pi-tui's editor owns ctrl+u
 		// ("delete to line start") and ctrl+d at a layer above overlays, so the
 		// ctrl forms never arrive — kept below as aliases for terminals where
@@ -1376,9 +1377,9 @@ export class AgentHubComponent {
 		// Tiered to the frame, never truncated mid-key: narrow presets get a
 		// shorter list, not half a binding.
 		const tiers = [
-			"J/K·↑/↓ select · j/k·u/d scroll · g/G top/tail · f scope · z size · x expand · s message · i interrupt · D stop · / find · q close",
-			"J/K select · j/k scroll · f scope · z size · x expand · s message · D stop · / find · q close",
-			"J/K select · j/k scroll · s message · z size · q close",
+			"j/k·↑/↓ select · J/K·u/d scroll · g/G top/tail · f scope · z size · x expand · s message · i interrupt · D stop · / find · q close",
+			"j/k select · J/K scroll · f scope · z size · x expand · s message · D stop · / find · q close",
+			"j/k select · J/K scroll · s message · z size · q close",
 			"s message · q close",
 		];
 		return tiers.find(tier => tier.length <= maxWidth) ?? tiers[tiers.length - 1]!;
