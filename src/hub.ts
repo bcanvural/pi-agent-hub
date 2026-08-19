@@ -17,7 +17,7 @@ import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui"
 import { findAck, readCapability, runnerReachable, steerInboxClosed, writeControlRequest, writeSteerRequestFile } from "./control-files.ts";
 import { readOutputTail, sanitizeLine, type OutputTail } from "./output-tail.ts";
 import { formatCost, formatTokens, UsageMeter } from "./usage.ts";
-import { asyncRunsRoot, isStale, lastBeat, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache } from "./runs.ts";
+import { asyncRunsRoot, compareRunRows, isStale, lastBeat, MAX_ROWS, rowKey, scanRuns, type RunRow, type ScanCache, type ScanResult } from "./runs.ts";
 import { askTimeoutMs, readSupervisorWait, supervisorChannels, waitExpired, type SupervisorChannel, type SupervisorWait } from "./supervisor-channel.ts";
 import { SubagentsRpc, type FleetSnapshot, type RpcEvents } from "./rpc.ts";
 import { DEFAULT_SIZE } from "./settings.ts";
@@ -211,6 +211,40 @@ export function overlayGeometry(sizePct: number): { width: `${number}%`; margin:
 	return { width: `${sizePct}%`, margin: sizePct >= 100 ? 0 : 1 };
 }
 
+interface TreeRowMeta {
+	depth: number;
+	parentId?: string;
+	isLastSibling: boolean;
+	isShell: boolean;
+	hasUnlinkedParent: boolean;
+	operationalRow?: RunRow;
+}
+
+/** Bash `tree`-style ancestry prefix, clipped from the left on pathological depth. */
+function treeBranch(
+	depth: number,
+	key: string,
+	maxWidth: number,
+	depthById: ReadonlyMap<string, number>,
+	parentById: ReadonlyMap<string, string>,
+	lastSiblingById: ReadonlyMap<string, boolean>,
+): string {
+	if (depth === 0) return "";
+	const segments: string[] = [lastSiblingById.get(key) ? "└── " : "├── "];
+	const ancestry = new Set<string>();
+	let parent = parentById.get(key);
+	while (parent && !ancestry.has(parent)) {
+		ancestry.add(parent);
+		if ((depthById.get(parent) ?? 0) === 0) break;
+		segments.push(lastSiblingById.get(parent) ? "    " : "│   ");
+		parent = parentById.get(parent);
+	}
+	const maxSegments = Math.max(1, Math.floor(Math.max(4, maxWidth - 2) / 4));
+	const omitted = Math.max(0, segments.length - maxSegments);
+	const prefix = segments.slice(0, maxSegments).reverse().join("");
+	return `${omitted > 0 ? "… " : ""}${prefix}`;
+}
+
 export class AgentHubComponent {
 	private rows: RunRow[] = [];
 	private scope: Scope = "session";
@@ -233,6 +267,7 @@ export class AgentHubComponent {
 	private disposed = false;
 
 	private mode: Mode = "nav";
+	private viewMode: "flat" | "tree" = "flat";
 	private composer = "";
 	private searchInput = "";
 	private searchQuery = "";
@@ -265,6 +300,11 @@ export class AgentHubComponent {
 	 * stat per occasional check after they converge. */
 	private readonly meters = new Map<string, UsageMeter>();
 	private lastRotated: string | undefined;
+
+	private treeMeta = new Map<string, TreeRowMeta>();
+	private depthMap = new Map<string, number>();
+	private parentMap = new Map<string, string>();
+	private lastSiblingMap = new Map<string, boolean>();
 
 	private readonly tui: TUI;
 	private readonly theme: Theme;
@@ -462,25 +502,183 @@ export class AgentHubComponent {
 	 * refresh. */
 	private readonly recordCounts = new Map<string, number>();
 
+	private projectTree(scopedLinked: RunRow[]): {
+		rows: RunRow[];
+		meta: Map<string, TreeRowMeta>;
+		depthMap: Map<string, number>;
+		parentMap: Map<string, string>;
+		lastSiblingMap: Map<string, boolean>;
+	} {
+		const rowByKey = new Map<string, RunRow>();
+		for (const row of scopedLinked) rowByKey.set(rowKey(row), row);
+
+		const rowsByRunId = new Map<string, RunRow[]>();
+		const rowsByRunAndStepKey = new Map<string, RunRow>();
+		for (const row of scopedLinked) {
+			let list = rowsByRunId.get(row.runId);
+			if (!list) {
+				list = [];
+				rowsByRunId.set(row.runId, list);
+			}
+			list.push(row);
+			const stepKey = row.stepWorkflowKey ?? row.workflowKey;
+			if (stepKey !== undefined) {
+				rowsByRunAndStepKey.set(JSON.stringify([row.runId, stepKey]), row);
+			}
+		}
+
+		const parentKeyByRow = new Map<string, string | undefined>();
+		const unlinkedParentByRow = new Map<string, boolean>();
+
+		for (const row of scopedLinked) {
+			const key = rowKey(row);
+			if (row.parentWorkflowRunId !== undefined) {
+				const parentKey = row.parentWorkflowKey ?? row.workflowKey;
+				let parentRow: RunRow | undefined;
+				if (parentKey !== undefined) {
+					parentRow = rowsByRunAndStepKey.get(JSON.stringify([row.parentWorkflowRunId, parentKey]));
+				}
+				if (parentRow && rowKey(parentRow) !== key) {
+					parentKeyByRow.set(key, rowKey(parentRow));
+				} else {
+					parentKeyByRow.set(key, undefined);
+					unlinkedParentByRow.set(key, true);
+				}
+			} else if (row.stepIndex > 0) {
+				const step0 = rowsByRunId.get(row.runId)?.[0];
+				if (step0 && rowKey(step0) !== key) {
+					parentKeyByRow.set(key, rowKey(step0));
+				} else {
+					parentKeyByRow.set(key, undefined);
+				}
+			} else {
+				parentKeyByRow.set(key, undefined);
+			}
+		}
+
+		const childrenOf = new Map<string | undefined, RunRow[]>();
+		for (const row of scopedLinked) {
+			const key = rowKey(row);
+			const parentKey = parentKeyByRow.get(key);
+			let list = childrenOf.get(parentKey);
+			if (!list) {
+				list = [];
+				childrenOf.set(parentKey, list);
+			}
+			list.push(row);
+		}
+
+		const roots = childrenOf.get(undefined) ?? [];
+		roots.sort(compareRunRows);
+
+		for (const [parentKey, siblings] of childrenOf.entries()) {
+			if (parentKey === undefined) continue;
+			siblings.sort((a, b) => {
+				if (a.stepIndex !== b.stepIndex) return a.stepIndex - b.stepIndex;
+				return compareRunRows(a, b);
+			});
+		}
+
+		const lastSiblingById = new Map<string, boolean>();
+		for (const siblings of childrenOf.values()) {
+			for (let i = 0; i < siblings.length; i++) {
+				lastSiblingById.set(rowKey(siblings[i]!), i === siblings.length - 1);
+			}
+		}
+
+		const flattened: RunRow[] = [];
+		const visited = new Set<string>();
+		const depthById = new Map<string, number>();
+		const parentById = new Map<string, string>();
+		const MAX_TREE_DEPTH = 32;
+
+		const stack: Array<{ row: RunRow; depth: number; parentKey?: string }> = [];
+		for (let i = roots.length - 1; i >= 0; i--) {
+			stack.push({ row: roots[i]!, depth: 0 });
+		}
+
+		while (stack.length > 0) {
+			const current = stack.pop()!;
+			const key = rowKey(current.row);
+			if (visited.has(key)) continue;
+			if (current.depth >= MAX_TREE_DEPTH) continue;
+			visited.add(key);
+			depthById.set(key, current.depth);
+			if (current.parentKey) parentById.set(key, current.parentKey);
+			flattened.push(current.row);
+			if (flattened.length >= MAX_ROWS) break;
+
+			const descendants = childrenOf.get(key);
+			if (descendants) {
+				for (let i = descendants.length - 1; i >= 0; i--) {
+					stack.push({ row: descendants[i]!, depth: current.depth + 1, parentKey: key });
+				}
+			}
+		}
+
+		if (flattened.length < MAX_ROWS) {
+			for (const row of scopedLinked) {
+				const key = rowKey(row);
+				if (!visited.has(key)) {
+					visited.add(key);
+					depthById.set(key, 0);
+					flattened.push(row);
+					if (flattened.length >= MAX_ROWS) break;
+				}
+			}
+		}
+
+		const meta = new Map<string, TreeRowMeta>();
+		for (const row of flattened) {
+			const key = rowKey(row);
+			const depth = depthById.get(key) ?? 0;
+			const isShell = row.mode === "workflow" && row.stepIndex === 0;
+			let operationalRow: RunRow | undefined = isShell ? undefined : row;
+			if (isShell) {
+				const descendantFiles = new Map<string, RunRow>();
+				const descStack = [...(childrenOf.get(key) ?? [])];
+				const descSeen = new Set<string>();
+				while (descStack.length > 0 && descSeen.size < 50) {
+					const desc = descStack.pop()!;
+					const descKey = rowKey(desc);
+					if (descSeen.has(descKey)) continue;
+					descSeen.add(descKey);
+					if (desc.sessionFile) descendantFiles.set(desc.sessionFile, desc);
+					const sub = childrenOf.get(descKey);
+					if (sub) descStack.push(...sub);
+				}
+				if (descendantFiles.size === 1) {
+					operationalRow = descendantFiles.values().next().value;
+				} else {
+					operationalRow = undefined;
+				}
+			}
+			meta.set(key, {
+				depth,
+				parentId: parentById.get(key),
+				isLastSibling: lastSiblingById.get(key) ?? true,
+				isShell,
+				hasUnlinkedParent: unlinkedParentByRow.get(key) ?? false,
+				operationalRow,
+			});
+		}
+
+		return {
+			rows: flattened.slice(0, MAX_ROWS),
+			meta,
+			depthMap: depthById,
+			parentMap: parentById,
+			lastSiblingMap: lastSiblingById,
+		};
+	}
+
 	private refreshRuns(): void {
 		if (this.disposed) return;
 		const now = Date.now();
-		const scoped = scanRuns(asyncRunsRoot(), this.scanCache).filter(row => this.inScope(row));
-		// One row per CONVERSATION. A revived run launches under its own id but
-		// continues the original child's session file, so two rows tail one
-		// file and render the identical chat — the same conversation shown
-		// twice, which reads as a phantom second agent. The liveliest record
-		// speaks for the group (a recorded "running" first, then the freshest
-		// beat) and wears the group's record count; actions then target the
-		// record that can still take them. Rows without a session file have
-		// nothing to share and never merge.
-		const groups = new Map<string, RunRow[]>();
-		for (const row of scoped) {
-			const key = row.sessionFile ?? `#${rowKey(row)}`;
-			const list = groups.get(key);
-			if (list) list.push(row);
-			else groups.set(key, [row]);
-		}
+		const scan = scanRuns(asyncRunsRoot(), this.scanCache, now);
+		const scopedKept = scan.kept.filter(row => this.inScope(row));
+		const scopedLinked = scan.linked.filter(row => this.inScope(row));
+
 		// Waits are probed over the PRE-merge records. Probing survivors only
 		// meant the verdict was computed before the information that could
 		// correct it existed — the third time this changeset paid for that
@@ -488,36 +686,92 @@ export class AgentHubComponent {
 		// parked original was never probed once a finished sibling record
 		// outranked it, and the buried conversation showed ✓ with "s resumes"
 		// offered against a provably parked child.
-		this.refreshWaits(scoped, now);
+		this.refreshWaits(scopedLinked, now);
 		this.recordCounts.clear();
+		this.treeMeta.clear();
+		this.depthMap.clear();
+		this.parentMap.clear();
+		this.lastSiblingMap.clear();
+
 		const hiddenToSurvivor = new Map<string, string>();
-		const merged: RunRow[] = [];
-		for (const group of groups.values()) {
-			let best = group[0]!;
-			for (const candidate of group.slice(1)) {
-				// ALIVE NOW outranks, judged with the channel in view — a parked
-				// child's heartbeat is frozen, so an isStale test called it dead
-				// and buried its unanswered question behind a finished sibling
-				// record. Before that, a bare "recorded running" test let detach
-				// residue outrank a fresh completion forever — the one word
-				// invariant 6 already calls untrustworthy, trusted by the merge
-				// added to serve it. Everything not alive competes on beat, so
-				// the freshest final record speaks for a finished conversation.
-				const alive = (row: RunRow): boolean => {
-					const liveness = this.liveness(row, now);
-					return liveness === "live" || liveness === "parked";
-				};
-				const bestLive = alive(best);
-				const candidateLive = alive(candidate);
-				if (candidateLive !== bestLive ? candidateLive : lastBeat(candidate, now) > lastBeat(best, now)) best = candidate;
+
+		if (this.viewMode === "flat") {
+			// One row per CONVERSATION. A revived run launches under its own id but
+			// continues the original child's session file, so two rows tail one
+			// file and render the identical chat — the same conversation shown
+			// twice, which reads as a phantom second agent. Workflow shells are the
+			// same case in another shape: their step can briefly have no sessionFile,
+			// so scanRuns links it to the child before this grouping. The liveliest
+			// child record speaks for the group (a recorded "running" first, then the
+			// freshest beat) and wears the group's record count; actions then target
+			// the record that can still take them. Rows without a session file or a
+			// workflow relation have nothing to share and never merge.
+			const groups = new Map<string, RunRow[]>();
+			for (const row of scopedKept) {
+				const key = row.sessionFile ?? `#${rowKey(row)}`;
+				const list = groups.get(key);
+				if (list) list.push(row);
+				else groups.set(key, [row]);
 			}
-			if (group.length > 1) {
-				this.recordCounts.set(rowKey(best), group.length);
-				for (const row of group) if (row !== best) hiddenToSurvivor.set(rowKey(row), rowKey(best));
+			const merged: Array<{ row: RunRow; createdAt: number; groupKey: string }> = [];
+			for (const [groupKey, group] of groups.entries()) {
+				// A revival/workflow shell may be newer than the child record that
+				// survives liveness selection. Keep the conversation's newest recorded
+				// creation time before choosing that survivor, or MAX_ROWS can discard
+				// the whole conversation behind newer unrelated rows.
+				const createdAt = group.reduce((latest, row) => Math.max(latest, row.createdAt ?? 0), 0);
+				let best = group[0]!;
+				for (const candidate of group.slice(1)) {
+					// A root workflow shell is a bookkeeping record, not the conversation
+					// the user can read or steer. A nested workflow is itself a child and
+					// must remain eligible for selection and controls.
+					const childRecord = (row: RunRow): boolean => row.mode !== "workflow" || row.parentWorkflowRunId !== undefined;
+					const bestChild = childRecord(best);
+					const candidateChild = childRecord(candidate);
+					if (candidateChild !== bestChild) {
+						if (candidateChild) best = candidate;
+						continue;
+					}
+					// ALIVE NOW outranks, judged with the channel in view — a parked
+					// child's heartbeat is frozen, so an isStale test called it dead
+					// and buried its unanswered question behind a finished sibling
+					// record. Before that, a bare "recorded running" test let detach
+					// residue outrank a fresh completion forever — the one word
+					// invariant 6 already calls untrustworthy, trusted by the merge
+					// added to serve it. Everything not alive competes on beat, so
+					// the freshest final record speaks for a finished conversation.
+					const alive = (row: RunRow): boolean => {
+						const liveness = this.liveness(row, now);
+						return liveness === "live" || liveness === "parked";
+					};
+					const bestLive = alive(best);
+					const candidateLive = alive(candidate);
+					if (candidateLive !== bestLive ? candidateLive : lastBeat(candidate, now) > lastBeat(best, now)) best = candidate;
+				}
+				if (group.length > 1) {
+					this.recordCounts.set(rowKey(best), group.length);
+					for (const row of group) if (row !== best) hiddenToSurvivor.set(rowKey(row), rowKey(best));
+				}
+				merged.push({ row: best, createdAt, groupKey });
 			}
-			merged.push(best);
+			// Group insertion order follows the raw scan, while the survivor can
+			// differ from the newest record. Order by the stable group creation key,
+			// then by group identity rather than liveness or output activity, before
+			// MAX_ROWS can hide a conversation.
+			merged.sort((left, right) => {
+				if (right.createdAt !== left.createdAt) return right.createdAt - left.createdAt;
+				return left.groupKey < right.groupKey ? -1 : left.groupKey > right.groupKey ? 1 : 0;
+			});
+			this.rows = merged.slice(0, MAX_ROWS).map(entry => entry.row);
+		} else {
+			const tree = this.projectTree(scopedLinked);
+			this.rows = tree.rows;
+			this.treeMeta = tree.meta;
+			this.depthMap = tree.depthMap;
+			this.parentMap = tree.parentMap;
+			this.lastSiblingMap = tree.lastSiblingMap;
 		}
-		this.rows = merged.slice(0, MAX_ROWS);
+
 		// A selection on a merged-away record follows its conversation to the
 		// survivor instead of snapping to the top of the list. The KEY swaps,
 		// nothing else: rows only merge because they share a session file, so
@@ -552,7 +806,12 @@ export class AgentHubComponent {
 			// The selected run may have moved to a session file it lacked at
 			// selection time (spawn order writes status before the child exists).
 			const row = this.selectedRow();
-			if (row?.sessionFile && this.tail?.filePath !== row.sessionFile) this.attachTail(row);
+			const meta = this.selectedKey ? this.treeMeta.get(this.selectedKey) : undefined;
+			const effectiveFile = row?.sessionFile ?? meta?.operationalRow?.sessionFile;
+			if (effectiveFile && this.tail?.filePath !== effectiveFile) {
+				const effectiveRow = row?.sessionFile ? row : meta?.operationalRow;
+				if (effectiveRow) this.attachTail(effectiveRow);
+			}
 		}
 		// A child parking on a supervisor reply changes nothing else about the
 		// run — same state, same heartbeat — so the wait belongs in the
@@ -561,7 +820,7 @@ export class AgentHubComponent {
 		// writes NOTHING, so without it the signature froze and the panel
 		// stopped repainting entirely — "12s active" still on screen three
 		// minutes into the park. One repaint per five seconds is the cost.
-		const signature = `${this.scope}|t:${Math.floor(now / 5000)}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.detached}|${this.liveness(row, now)}|${this.waitFor(row)?.requestId}|${this.recordCounts.get(rowKey(row)) ?? 1}|${row.lastUpdate}|${row.currentTool}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
+		const signature = `${this.scope}|${this.viewMode}|t:${Math.floor(now / 5000)}|${this.rows.map(row => `${rowKey(row)}|${row.state}|${row.detached}|${this.liveness(row, now)}|${this.waitFor(row)?.requestId}|${this.recordCounts.get(rowKey(row)) ?? 1}|${row.lastUpdate}|${row.currentTool}`).join(";")}|rpc:${this.rpcInfo.available}:${this.rpcInfo.totalActive}`;
 		if (signature !== this.lastSignature) {
 			this.lastSignature = signature;
 			this.tui.requestRender();
@@ -678,8 +937,10 @@ export class AgentHubComponent {
 	 * finish — the one live signal a long tool call gives off. */
 	private pollLiveOutput(): void {
 		const row = this.selectedRow();
+		const meta = this.selectedKey ? this.treeMeta.get(this.selectedKey) : undefined;
+		const effectiveRow = (this.viewMode === "tree" && row?.mode === "workflow" && meta?.operationalRow) ? meta.operationalRow : row;
 		const now = Date.now();
-		const live = row !== undefined && this.maybeLive(row, now) && this.follow;
+		const live = effectiveRow !== undefined && this.maybeLive(effectiveRow, now) && this.follow;
 		if (!live) {
 			if (this.liveOutput !== undefined) {
 				this.liveOutput = undefined;
@@ -687,8 +948,8 @@ export class AgentHubComponent {
 			}
 			return;
 		}
-		const stepLog = path.join(row.dir, `output-${row.stepIndex}.log`);
-		const file = fs.existsSync(stepLog) ? stepLog : row.outputFile ? path.join(row.dir, row.outputFile) : undefined;
+		const stepLog = path.join(effectiveRow.dir, `output-${effectiveRow.stepIndex}.log`);
+		const file = fs.existsSync(stepLog) ? stepLog : effectiveRow.outputFile ? path.join(effectiveRow.dir, effectiveRow.outputFile) : undefined;
 		this.liveOutputFile = file;
 		const next = file ? readOutputTail(file, LIVE_OUTPUT_LINES, this.liveOutput) : undefined;
 		if (next?.stamp !== this.liveOutput?.stamp) {
@@ -722,6 +983,10 @@ export class AgentHubComponent {
 		}
 	}
 
+	private conversationKey(row: RunRow): string {
+		return row.sessionFile ?? rowKey(row);
+	}
+
 	private selectedRow(): RunRow | undefined {
 		return this.rows.find(row => rowKey(row) === this.selectedKey);
 	}
@@ -735,7 +1000,9 @@ export class AgentHubComponent {
 		this.searchCursor = -1;
 		this.liveOutput = undefined;
 		const row = this.selectedRow();
-		if (row?.sessionFile) this.attachTail(row);
+		const meta = key ? this.treeMeta.get(key) : undefined;
+		const effectiveRow = row?.sessionFile ? row : (meta?.operationalRow?.sessionFile ? meta.operationalRow : undefined);
+		if (effectiveRow?.sessionFile) this.attachTail(effectiveRow);
 		else this.tail = undefined;
 		this.tui.requestRender();
 	}
@@ -760,7 +1027,29 @@ export class AgentHubComponent {
 	/** The notice the action row shows: the selected run's, else the global
 	 * one. Fresh entries only; expiry is pruned on the poll tick. */
 	private visibleNotice(now: number): Notice | undefined {
-		for (const key of [this.selectedKey ?? "", ""]) {
+		if (this.selectedKey === undefined) {
+			const globalNotice = this.notices.get("");
+			return globalNotice && now - globalNotice.at <= this.noticeTtl(globalNotice) ? globalNotice : undefined;
+		}
+		const selected = this.selectedRow();
+		const meta = this.treeMeta.get(this.selectedKey);
+		const candidates = [
+			this.selectedKey,
+			...(selected ? [this.conversationKey(selected)] : []),
+			...(meta?.operationalRow ? [this.conversationKey(meta.operationalRow), rowKey(meta.operationalRow)] : []),
+		];
+		for (const [key, treeMeta] of this.treeMeta.entries()) {
+			if (treeMeta.operationalRow && (rowKey(treeMeta.operationalRow) === this.selectedKey || (selected?.sessionFile && treeMeta.operationalRow.sessionFile === selected.sessionFile))) {
+				candidates.push(key);
+			}
+		}
+		if (selected?.sessionFile) {
+			for (const row of this.rows) {
+				if (row.sessionFile === selected.sessionFile) candidates.push(rowKey(row));
+			}
+		}
+		candidates.push("");
+		for (const key of candidates) {
 			const notice = this.notices.get(key);
 			if (notice && now - notice.at <= this.noticeTtl(notice)) return notice;
 		}
@@ -789,18 +1078,34 @@ export class AgentHubComponent {
 		return this.maybeLive(row, now) ? "steer" : "resume";
 	}
 
+	private resolveTargetRow(row: RunRow): { targetRow?: RunRow; reason?: string } {
+		if (this.viewMode === "flat" || row.mode !== "workflow") {
+			return { targetRow: row };
+		}
+		const meta = this.treeMeta.get(rowKey(row));
+		if (meta?.operationalRow) {
+			return { targetRow: meta.operationalRow };
+		}
+		return { reason: "workflow shell — select specific child step to control" };
+	}
+
 	/** Synchronous acceptance check: true means the message is on its way and
 	 * the composer may clear. Refusing AFTER the composer cleared destroyed
 	 * whatever the user had typed. */
 	private trySend(row: RunRow, text: string): boolean {
+		const { targetRow, reason } = this.resolveTargetRow(row);
+		if (!targetRow) {
+			this.setNotice(reason ?? "cannot control this workflow shell", "error", this.conversationKey(row));
+			return false;
+		}
 		if (this.actionBusy) {
-			this.setNotice("still sending the previous action — your text is kept", "info", rowKey(row));
+			this.setNotice("still sending the previous action — your text is kept", "info", this.conversationKey(targetRow));
 			return false;
 		}
 		this.actionBusy = true;
 		void (async () => {
 			try {
-				await this.sendMessageInner(row, text);
+				await this.sendMessageInner(targetRow, text);
 			} finally {
 				this.actionBusy = false;
 			}
@@ -809,7 +1114,7 @@ export class AgentHubComponent {
 	}
 
 	private async sendMessageInner(row: RunRow, text: string): Promise<void> {
-		const key = rowKey(row);
+		const key = this.conversationKey(row);
 		this.setNotice(`sending to ${row.agent}…`, "info", key);
 		const target = { id: row.runId, ...(row.stepCount > 1 ? { index: row.stepIndex } : {}) };
 		const owns = this.ownsRun(row);
@@ -893,8 +1198,13 @@ export class AgentHubComponent {
 	}
 
 	private async interruptRun(row: RunRow): Promise<void> {
-		const key = rowKey(row);
-		if (this.channelFor(row, Date.now()) !== "steer") {
+		const { targetRow, reason } = this.resolveTargetRow(row);
+		if (!targetRow) {
+			this.setNotice(reason ?? "cannot control this workflow shell", "error", this.conversationKey(row));
+			return;
+		}
+		const key = this.conversationKey(targetRow);
+		if (this.channelFor(targetRow, Date.now()) !== "steer") {
 			this.setNotice("nothing to interrupt — this run is not live", "error", key);
 			return;
 		}
@@ -903,9 +1213,9 @@ export class AgentHubComponent {
 			return;
 		}
 		this.actionBusy = true;
-		this.setNotice(`interrupting ${sanitizeLine(row.agent)}…`, "info", key);
+		this.setNotice(`interrupting ${sanitizeLine(targetRow.agent)}…`, "info", key);
 		try {
-			await this.interruptInner(row, key);
+			await this.interruptInner(targetRow, key);
 		} finally {
 			this.actionBusy = false;
 		}
@@ -927,7 +1237,7 @@ export class AgentHubComponent {
 	 * as steering: a dead runner or a closed inbox means the file would sit
 	 * unread forever, so refuse with the reason instead of claiming delivery. */
 	private fileControlRequest(row: RunRow, kind: "interrupt" | "stop"): void {
-		const key = rowKey(row);
+		const key = this.conversationKey(row);
 		if (!runnerReachable(readCapability(row.dir, row.stepIndex))) {
 			this.setNotice(`no channel to ${kind} this run — no live runner owns it`, "error", key);
 			return;
@@ -937,7 +1247,7 @@ export class AgentHubComponent {
 			return;
 		}
 		try {
-			writeControlRequest(row.dir, kind, "requested from pi-agent-hub");
+			writeControlRequest(row.dir, kind, "requested from pi-agent-hub", row.stepCount > 1 ? row.stepIndex : (row.stepIndex > 0 ? row.stepIndex : undefined));
 			this.setNotice(`${kind} dropped in the runner's inbox`, "info", key);
 		} catch (error) {
 			this.setNotice(error instanceof Error ? error.message : String(error), "error", key);
@@ -945,15 +1255,20 @@ export class AgentHubComponent {
 	}
 
 	private async stopRun(row: RunRow): Promise<void> {
-		const key = rowKey(row);
+		const { targetRow, reason } = this.resolveTargetRow(row);
+		if (!targetRow) {
+			this.setNotice(reason ?? "cannot control this workflow shell", "error", this.conversationKey(row));
+			return;
+		}
+		const key = this.conversationKey(targetRow);
 		if (this.actionBusy) {
 			this.setNotice("still sending the previous action…", "info", key);
 			return;
 		}
 		this.actionBusy = true;
-		this.setNotice(`stopping ${sanitizeLine(row.agent)}…`, "info", key);
+		this.setNotice(`stopping ${sanitizeLine(targetRow.agent)}…`, "info", key);
 		try {
-			await this.stopInner(row, key);
+			await this.stopInner(targetRow, key);
 		} finally {
 			this.actionBusy = false;
 		}
@@ -964,7 +1279,7 @@ export class AgentHubComponent {
 			this.fileControlRequest(row, "stop");
 			return;
 		}
-		const outcome = await this.rpc.stop({ id: row.runId });
+		const outcome = await this.rpc.stop({ id: row.runId, ...(row.stepCount > 1 ? { index: row.stepIndex } : {}) });
 		if (this.disposed) return;
 		if (outcome.ok) {
 			this.setNotice(outcome.text || "stop requested", "success", key);
@@ -976,26 +1291,32 @@ export class AgentHubComponent {
 	/** Open the child's cwd / copy its session path. User-invoked one-shots;
 	 * failure is a notice, never a throw. */
 	private openCwd(row: RunRow): void {
-		if (!row.cwd) return this.setNotice("this run recorded no working directory", "error");
+		const key = this.conversationKey(row);
+		const meta = this.selectedKey ? this.treeMeta.get(this.selectedKey) : undefined;
+		const effectiveCwd = row.cwd ?? meta?.operationalRow?.cwd;
+		if (!effectiveCwd) return this.setNotice("this run recorded no working directory", "error", key);
 		const opener = process.platform === "darwin" ? "open" : "xdg-open";
 		try {
-			const proc = child_process.spawn(opener, [row.cwd], { detached: true, stdio: "ignore" });
+			const proc = child_process.spawn(opener, [effectiveCwd], { detached: true, stdio: "ignore" });
 			// Spawn failure arrives as an async 'error' event; without a listener
 			// it becomes an uncaughtException, and pi answers that with
 			// process.exit(1) — one keypress on a machine without the opener
 			// destroyed the whole session.
 			proc.on("error", error => {
-				if (!this.disposed) this.setNotice(`could not open: ${(error as NodeJS.ErrnoException).code === "ENOENT" ? `${opener} not available` : error.message}`, "error");
+				if (!this.disposed) this.setNotice(`could not open: ${(error as NodeJS.ErrnoException).code === "ENOENT" ? `${opener} not available` : error.message}`, "error", key);
 			});
 			proc.unref();
-			this.setNotice(`opening ${row.cwd}`, "info");
+			this.setNotice(`opening ${effectiveCwd}`, "info", key);
 		} catch (error) {
-			this.setNotice(`could not open: ${error instanceof Error ? error.message : String(error)}`, "error");
+			this.setNotice(`could not open: ${error instanceof Error ? error.message : String(error)}`, "error", key);
 		}
 	}
 
 	private copySessionPath(row: RunRow): void {
-		if (!row.sessionFile) return this.setNotice("this run recorded no session file", "error");
+		const key = this.conversationKey(row);
+		const meta = this.selectedKey ? this.treeMeta.get(this.selectedKey) : undefined;
+		const effectiveSessionFile = row.sessionFile ?? meta?.operationalRow?.sessionFile;
+		if (!effectiveSessionFile) return this.setNotice("this run recorded no session file", "error", key);
 		const tool = process.platform === "darwin" ? "pbcopy" : "xclip";
 		const args = process.platform === "darwin" ? [] : ["-selection", "clipboard"];
 		try {
@@ -1003,19 +1324,19 @@ export class AgentHubComponent {
 			let failed = false;
 			proc.on("error", () => {
 				failed = true;
-				if (!this.disposed) this.setNotice(`copy failed (${tool} not available)`, "error");
+				if (!this.disposed) this.setNotice(`copy failed (${tool} not available)`, "error", key);
 			});
 			// Success is claimed when the path has been handed over, not before:
 			// pbcopy exits (close fires), but xclip forks to own the selection
 			// and never closes — gating on close left Linux permanently silent.
 			proc.stdin.on("error", () => {});
-			proc.stdin.end(row.sessionFile, () => {
+			proc.stdin.end(effectiveSessionFile, () => {
 				setTimeout(() => {
-					if (!this.disposed && !failed) this.setNotice("session path copied", "success");
+					if (!this.disposed && !failed) this.setNotice("session path copied", "success", key);
 				}, 60);
 			});
 		} catch (error) {
-			this.setNotice(`copy failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			this.setNotice(`copy failed: ${error instanceof Error ? error.message : String(error)}`, "error", key);
 		}
 	}
 
@@ -1188,6 +1509,12 @@ export class AgentHubComponent {
 		}
 		if (data === "f") {
 			this.scope = SCOPE_ORDER[(SCOPE_ORDER.indexOf(this.scope) + 1) % SCOPE_ORDER.length]!;
+			this.lastSignature = "";
+			this.refreshRuns();
+			return;
+		}
+		if (data === "t") {
+			this.viewMode = this.viewMode === "flat" ? "tree" : "flat";
 			this.lastSignature = "";
 			this.refreshRuns();
 			return;
@@ -1474,7 +1801,7 @@ export class AgentHubComponent {
 						: dim("No agents running"),
 			...(!sessionUnknown && waiting > 0 ? [this.theme.fg("accent", `! ${waiting} waiting on you`)] : []),
 			...(!sessionUnknown && unknown > 0 ? [dim(`? ${unknown} unknown`)] : []),
-			sessionUnknown ? dim("r retries · f scope") : dim(`${this.rows.length} run${this.rows.length === 1 ? "" : "s"} ${scopeLabel} · f scope`),
+			sessionUnknown ? dim("r retries · f scope") : dim(`${this.rows.length} ${this.viewMode === "tree" ? "tree nodes" : "runs"} ${scopeLabel} · t ${this.viewMode === "tree" ? "flat" : "tree"} · f scope`),
 			...(!sessionUnknown && scopeCost > 0 ? [dim(`${formatCost(scopeCost)}${scopeCostComplete ? "" : "…"}`)] : []),
 			!this.rpcInfo.available
 				? dim("subagents not answering")
@@ -1521,9 +1848,9 @@ export class AgentHubComponent {
 		// Tiered to the frame, never truncated mid-key: narrow presets get a
 		// shorter list, not half a binding.
 		const tiers = [
-			"j/k·↑/↓ select · J/K·u/d scroll · g/G top/tail · f scope · z size · x expand · s message · i interrupt · D stop · / find · q close",
-			"j/k select · J/K scroll · f scope · z size · x expand · s message · D stop · / find · q close",
-			"j/k select · J/K scroll · s message · z size · q close",
+			"j/k·↑/↓ select · J/K·u/d scroll · g/G top/tail · t view · f scope · z size · x expand · s message · i interrupt · D stop · / find · q close",
+			"j/k select · J/K scroll · t view · f scope · z size · x expand · s message · D stop · / find · q close",
+			"j/k select · J/K scroll · t view · s message · z size · q close",
 			"s message · q close",
 		];
 		return tiers.find(tier => tier.length <= maxWidth) ?? tiers[tiers.length - 1]!;
@@ -1534,10 +1861,16 @@ export class AgentHubComponent {
 	private renderActionRow(width: number, now: number): string {
 		const dim = (text: string): string => this.theme.fg("dim", text);
 		const row = this.selectedRow();
+		const targetInfo = row ? this.resolveTargetRow(row) : { targetRow: undefined };
+		const targetRow = targetInfo.targetRow ?? row;
+
 		if (this.mode === "compose" || this.mode === "search") {
 			const composing = this.mode === "compose";
-			const channel = composing && row ? this.channelFor(row, now) : undefined;
-			const label = composing ? `${channel} → ${sanitizeLine(row?.agent ?? "?")}` : "find";
+			const channel = composing && targetRow ? this.channelFor(targetRow, now) : undefined;
+			const targetAnnotation = composing && row && targetRow && targetRow !== row
+				? ` [▹ ${sanitizeLine(targetRow.agent)}]`
+				: "";
+			const label = composing ? `${channel} → ${sanitizeLine(row?.agent ?? "?")}${targetAnnotation}` : "find";
 			const buffer = composing ? this.composer : this.searchInput;
 			const prompt = `${this.theme.fg("accent", label)} ${dim("›")} `;
 			const room = Math.max(8, width - visibleWidth(prompt) - 2);
@@ -1569,9 +1902,14 @@ export class AgentHubComponent {
 			return this.theme.fg(tone, notice.text);
 		}
 		if (row) {
-			const channel = this.channelFor(row, now);
-			if (this.ownsRun(row) === false && !(channel === "steer" && this.cachedRunnerProbe(row, now))) {
-				return dim("view-only · launched by another pi session · o cwd · y copy path");
+			if (this.viewMode === "tree" && row.mode === "workflow" && !targetInfo.targetRow) {
+				return truncateToWidth(dim(`workflow shell · ${targetInfo.reason ?? "select specific child step to control"}`), width);
+			}
+			const activeTarget = targetRow ?? row;
+			const channel = this.channelFor(activeTarget, now);
+			const targetAnnotation = activeTarget !== row ? ` [▹ ${sanitizeLine(activeTarget.agent)}]` : "";
+			if (this.ownsRun(activeTarget) === false && !(channel === "steer" && this.cachedRunnerProbe(activeTarget, now))) {
+				return dim(`view-only · launched by another pi session${targetAnnotation} · o cwd · y copy path`);
 			}
 			// A parked child is not reading its steer inbox — it is blocked in a
 			// poll for the reply file. Saying "s steers the running child" there
@@ -1580,11 +1918,11 @@ export class AgentHubComponent {
 			// make, so the row says where the reply belongs. The keys stay
 			// advertised: they all still work, and this was the only row that
 			// stopped naming them.
-			if (this.liveness(row, now) === "parked") {
+			if (this.liveness(activeTarget, now) === "parked") {
 				// The question, not the enum: `reason` is a token like
 				// "interview_request", while `message` is what was actually
 				// asked — and the message was being read, bounded and dropped.
-				const wait = this.waitFor(row);
+				const wait = this.waitFor(activeTarget);
 				const asked = sanitizeLine(wait?.message || wait?.reason || "");
 				// Only a request envelope proves the ask was addressed HERE.
 				// Upstream raises the same flag for `intercom ask`, which may be
@@ -1592,14 +1930,14 @@ export class AgentHubComponent {
 				// question asked of another agent, with no question attached
 				// because there is no envelope to quote. Without one, say the
 				// child is blocked and stop short of naming who owes the reply.
-				if (!asked) return dim("parked on a reply · i interrupt · D stop · o cwd · y copy path");
-				return dim(`parked: answer in the conversation — “${asked}” · i interrupt · D stop · o cwd · y copy path`);
+				if (!asked) return dim(`parked on a reply${targetAnnotation} · i interrupt · D stop · o cwd · y copy path`);
+				return dim(`parked: answer in the conversation — “${asked}”${targetAnnotation} · i interrupt · D stop · o cwd · y copy path`);
 			}
 			// "the running child" is a claim, and after an ask ran out with the
 			// heartbeat frozen it is exactly the claim nothing supports.
-			const explain = this.liveness(row, now) === "unknown"
-				? `s sends · ${this.quietLabel(row, now)}`
-				: channel === "steer" ? "s steers the running child" : row.state === "running" ? "s revives this stalled run" : "s resumes the conversation";
+			const explain = this.liveness(activeTarget, now) === "unknown"
+				? `s sends${targetAnnotation} · ${this.quietLabel(activeTarget, now)}`
+				: channel === "steer" ? `s steers the running child${targetAnnotation}` : activeTarget.state === "running" ? `s revives this stalled run${targetAnnotation}` : `s resumes the conversation${targetAnnotation}`;
 			return dim(`${explain} · i interrupt · D stop · o cwd · y copy path`);
 		}
 		return dim("no run selected");
@@ -1673,7 +2011,7 @@ export class AgentHubComponent {
 			if (this.scope === "session" && this.rpc.sessionId === undefined) {
 				return [dim("session not identified yet"), dim("the bridge has not named this session"), dim("r retries · f changes scope")];
 			}
-			return [dim(`no runs ${this.scope === "machine" ? "found" : this.scope === "project" ? "in this project" : "in this session"}`), dim("f changes scope"), dim("q closes")];
+			return [dim(`no runs ${this.scope === "machine" ? "found" : this.scope === "project" ? "in this project" : "in this session"}`), dim("f changes scope · t toggle view"), dim("q closes")];
 		}
 		// Two lines per entry, the way omp's roster reads: the name row with
 		// the model and recency right-aligned, then a dim per-run stats row.
@@ -1686,6 +2024,7 @@ export class AgentHubComponent {
 		const lines: string[] = [];
 		for (let index = this.listWindowTop; index < Math.min(this.rows.length, this.listWindowTop + visibleEntries); index++) {
 			const row = this.rows[index]!;
+			const key = rowKey(row);
 			const selected = index === selectedIndex;
 			const marker = selected ? this.theme.fg("accent", "▸") : " ";
 			// Agent, tool, state and model strings come from another extension's
@@ -1700,30 +2039,67 @@ export class AgentHubComponent {
 			let right = [model, age].filter(Boolean).join(" · ");
 			if (right && visibleWidth(right) > width - 10) right = age;
 			const rightStyled = right ? dim(right) : "";
-			const leftBudget = Math.max(4, width - (right ? visibleWidth(right) + 1 : 0) - 3);
-			const nameShown = truncateToWidth(name, leftBudget);
-			const gap = Math.max(1, width - 3 - visibleWidth(nameShown) - visibleWidth(right));
-			lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${nameShown}${" ".repeat(gap)}${rightStyled}`, width));
 
-			const detail = sanitizeLine(this.stateLabel(row, now));
-			const step = row.stepCount > 1 ? `#${row.stepIndex} · ` : "";
-			const active = row.startedAt !== undefined ? formatDuration((row.lastActivityAt ?? row.lastUpdate ?? row.startedAt) - row.startedAt) : "";
-			const meter = this.usageFor(row.sessionFile);
-			const cost = meter && (meter.done || meter.totals.cost > 0)
-				? `${formatCost(meter.totals.cost)}${meter.done ? "" : "…"}`
-				: row.sessionFileExists ? "$…" : undefined;
-			const records = this.recordCounts.get(rowKey(row));
-			const statsParts = [
-				`${step}${detail}`,
-				// Honest about the merge: this row speaks for more than one run
-				// record of the same conversation (a revival and its original).
-				...(records !== undefined ? [`${records} records`] : []),
-				...(cost ? [cost] : []),
-				...(active ? [`${active} active`] : []),
-				...(row.turnCount !== undefined ? [`${row.turnCount} req`] : []),
-				...(row.toolCount !== undefined ? [`${row.toolCount} tools`] : []),
-			];
-			lines.push(truncateToWidth(`   ${dim(statsParts.join(" · "))}`, width));
+			if (this.viewMode === "tree") {
+				const meta = this.treeMeta.get(key);
+				const depth = meta?.depth ?? 0;
+				const branch = treeBranch(depth, key, Math.max(4, Math.floor(width / 3)), this.depthMap, this.parentMap, this.lastSiblingMap);
+				const branchStyled = branch ? dim(branch) : "";
+				const leftBudget = Math.max(4, width - visibleWidth(branch) - (right ? visibleWidth(right) + 1 : 0) - 3);
+				const nameShown = truncateToWidth(name, leftBudget);
+				const gap = Math.max(1, width - 3 - visibleWidth(branch) - visibleWidth(nameShown) - visibleWidth(right));
+				lines.push(truncateToWidth(`${marker}${branchStyled}${this.stateGlyph(row, now)} ${nameShown}${" ".repeat(gap)}${rightStyled}`, width));
+
+				const detail = sanitizeLine(this.stateLabel(row, now));
+				const step = row.stepCount > 1 ? `#${row.stepIndex} · ` : "";
+				const active = row.startedAt !== undefined ? formatDuration((row.lastActivityAt ?? row.lastUpdate ?? row.startedAt) - row.startedAt) : "";
+				let cost: string | undefined;
+				if (meta?.isShell) {
+					const sharesWithChild = meta.operationalRow?.sessionFile && row.sessionFile === meta.operationalRow.sessionFile;
+					cost = sharesWithChild ? "shared" : "—";
+				} else {
+					const meter = this.usageFor(row.sessionFile);
+					cost = meter && (meter.done || meter.totals.cost > 0)
+						? `${formatCost(meter.totals.cost)}${meter.done ? "" : "…"}`
+						: row.sessionFileExists ? "$…" : undefined;
+				}
+				const indent = " ".repeat(Math.min(12, 3 + depth * 2));
+				const statsParts = [
+					`${step}${detail}`,
+					...(meta?.isShell ? [dim("shell")] : []),
+					...(meta?.hasUnlinkedParent ? [dim("unlinked parent")] : []),
+					...(cost ? [cost] : []),
+					...(active ? [`${active} active`] : []),
+					...(row.turnCount !== undefined ? [`${row.turnCount} req`] : []),
+					...(row.toolCount !== undefined ? [`${row.toolCount} tools`] : []),
+				];
+				lines.push(truncateToWidth(`${indent}${dim(statsParts.join(" · "))}`, width));
+			} else {
+				const leftBudget = Math.max(4, width - (right ? visibleWidth(right) + 1 : 0) - 3);
+				const nameShown = truncateToWidth(name, leftBudget);
+				const gap = Math.max(1, width - 3 - visibleWidth(nameShown) - visibleWidth(right));
+				lines.push(truncateToWidth(`${marker}${this.stateGlyph(row, now)} ${nameShown}${" ".repeat(gap)}${rightStyled}`, width));
+
+				const detail = sanitizeLine(this.stateLabel(row, now));
+				const step = row.stepCount > 1 ? `#${row.stepIndex} · ` : "";
+				const active = row.startedAt !== undefined ? formatDuration((row.lastActivityAt ?? row.lastUpdate ?? row.startedAt) - row.startedAt) : "";
+				const meter = this.usageFor(row.sessionFile);
+				const cost = meter && (meter.done || meter.totals.cost > 0)
+					? `${formatCost(meter.totals.cost)}${meter.done ? "" : "…"}`
+					: row.sessionFileExists ? "$…" : undefined;
+				const records = this.recordCounts.get(key);
+				const statsParts = [
+					`${step}${detail}`,
+					// Honest about the merge: this row speaks for more than one run
+					// record of the same conversation (a revival and its original).
+					...(records !== undefined ? [`${records} records`] : []),
+					...(cost ? [cost] : []),
+					...(active ? [`${active} active`] : []),
+					...(row.turnCount !== undefined ? [`${row.turnCount} req`] : []),
+					...(row.toolCount !== undefined ? [`${row.toolCount} tools`] : []),
+				];
+				lines.push(truncateToWidth(`   ${dim(statsParts.join(" · "))}`, width));
+			}
 		}
 		// Inside the budget, not appended past it: a line beyond the frame's
 		// height is cropped and the notice never reaches the reader.
@@ -1754,6 +2130,7 @@ export class AgentHubComponent {
 		if (!row) return [this.theme.fg("dim", "nothing selected")];
 		const dim = (text: string): string => this.theme.fg("dim", text);
 		const now = Date.now();
+		const meta = this.selectedKey ? this.treeMeta.get(this.selectedKey) : undefined;
 
 		// A position counted in wrapped lines does not survive a change of wrap
 		// width — line 3876 at one width is a different place at another, so
@@ -1769,15 +2146,35 @@ export class AgentHubComponent {
 			}
 		}
 
+		if (!row.sessionFile && (!meta?.operationalRow?.sessionFile || !this.tail)) {
+			const lines: string[] = [
+				this.theme.bold(`Workflow Shell: ${sanitizeLine(row.agent)}`),
+				dim(`Run ID: ${sanitizeLine(row.runId)}`),
+				dim(`Status: ${sanitizeLine(this.headerLabel(row, now))}`),
+				...(row.workflowKey ? [dim(`Lane key: ${sanitizeLine(row.workflowKey)}`)] : []),
+				...(row.stepCount > 1 ? [dim(`Step: ${row.stepIndex + 1} of ${row.stepCount}`)] : []),
+				...(row.cwd ? [dim(`Working directory: ${sanitizeLine(row.cwd)}`)] : []),
+				"",
+				dim("This is a workflow coordinator shell record."),
+				dim("Select a child step from the list on the left to inspect its conversation."),
+			];
+			return lines.map(line => truncateToWidth(line, width));
+		}
+
 		// The same verdict the list row shows. Interpolating the recorded state
 		// raw claimed "running" for a run whose heartbeat had stopped, one
 		// column away from a row already calling it stale.
-		const state = sanitizeLine(this.headerLabel(row, now));
-		const meter = this.usageFor(row.sessionFile);
+		const effectiveRow = (this.viewMode === "tree" && row.mode === "workflow" && meta?.operationalRow) ? meta.operationalRow : row;
+		const state = sanitizeLine(this.headerLabel(effectiveRow, now));
+		const effectiveSessionFile = row.sessionFile ?? meta?.operationalRow?.sessionFile;
+		const meter = this.usageFor(effectiveSessionFile);
 		const usage = meter && (meter.done || meter.totals.cost > 0)
 			? ` · ${formatCost(meter.totals.cost)}${meter.done ? "" : "…"} · ${formatTokens(meter.totals.tokens)} tok`
 			: "";
-		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${row.model ? ` · ${sanitizeLine(row.model)}` : ""}${usage} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
+		const shellAnnotation = meta?.isShell && meta.operationalRow && meta.operationalRow !== row
+			? ` · [shell ▹ ${sanitizeLine(meta.operationalRow.agent)}]`
+			: "";
+		const header = `${this.theme.fg("toolTitle", this.theme.bold(sanitizeLine(row.agent)))} ${dim(`· ${state}${shellAnnotation}${row.model ? ` · ${sanitizeLine(row.model)}` : ""}${usage} · ${sanitizeLine(row.runId).slice(0, 8)}`)}`;
 		// The reason under the verdict. A bare "failed" is the start of a
 		// question whose answer is already in the artifact — "completed without
 		// making edits for an implementation task" — and reading it should not
@@ -1794,14 +2191,14 @@ export class AgentHubComponent {
 		// extra line, so keeping it there emitted one row more than the caller
 		// budgeted and the clip landed on the conversation instead. A reason
 		// with no conversation under it is not the trade to make.
-		const reason = row.state !== "running" && row.error !== undefined && height >= 4
-			? [truncateToWidth(dim(`why: ${sanitizeLine(row.error)}`), width)]
+		const reason = effectiveRow.state !== "running" && effectiveRow.error !== undefined && height >= 4
+			? [truncateToWidth(dim(`why: ${sanitizeLine(effectiveRow.error)}`), width)]
 			: [];
 		const paneHeight = Math.max(1, height - 2 - reason.length);
 		this.lastPaneHeight = paneHeight;
 		// One row is reserved for the scroll indicator, and a block for the live
 		// output tail — reserved, not overwritten, so neither costs content.
-		const liveLines = this.follow && this.maybeLive(row, now) ? (this.liveOutput?.lines ?? []) : [];
+		const liveLines = this.follow && this.maybeLive(effectiveRow, now) ? (this.liveOutput?.lines ?? []) : [];
 		const reserved = (this.chatScroll > 0 ? 1 : 0) + (liveLines.length > 0 ? liveLines.length + 1 : 0);
 		const viewHeight = Math.max(1, paneHeight - reserved);
 		this.lastChatHeight = viewHeight;
@@ -1850,7 +2247,7 @@ export class AgentHubComponent {
 				// Offer the revive only where `s` actually revives: a parked or
 				// merely quiet child is alive, and telling the reader to revive
 				// one is the same lie the row above no longer tells.
-				body.push(dim(this.maybeLive(row, now) ? "no conversation recorded yet" : "no conversation recorded — s revives this run"));
+				body.push(dim(this.maybeLive(effectiveRow, now) ? "no conversation recorded yet" : "no conversation recorded — s revives this run"));
 			}
 		}
 

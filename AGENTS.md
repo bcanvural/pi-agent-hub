@@ -111,11 +111,12 @@ history.
 - Tabs; comments state constraints and consequences ("why this must hold"),
   never narrate the next line. Commit messages explain the defect's failure
   mode, not the diff.
-- Substantial changes go through an adversarial review round before being
-  called done: an agent instructed to *execute* attacks (not read-and-approve),
-  then a back-and-forth where its findings are independently verified before
-  fixing, and the fixes attacked again. Every fix round so far has contained
-  a defect of its own; plan for that.
+- **Cognitive workspace (IV/DC):** See `docs/DC-0001-agentic-workspace.md` for
+  organizing initiatives (`docs/IV-XXXX-*.md`) and doctrines (`docs/DC-XXXX-*.md`).
+- **Adversarial review rounds:** Substantial changes go through a 3-pass
+  adversarial review gauntlet using stock `pi-subagents` reviewer with escalating model tiers
+  (`deepseek-v4-flash` max → `gemini-3.7-flash` high → `gpt-5.6-sol` high), with live
+  back-and-forth discussion through the supervisor channel before being called done.
 - Testing against real artifacts (`$TMPDIR/pi-subagents-uid-*/`,
   `~/.pi/agent/sessions/`) is read-only, always. Anything that mutates gets a
   synthetic fixture. Live children for end-to-end checks are spawned in a

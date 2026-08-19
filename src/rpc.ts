@@ -181,7 +181,7 @@ export class SubagentsRpc {
 	}
 
 	resume(target: RunTarget, message: string): Promise<ActionOutcome> {
-		return this.action("resume", { id: target.id, message });
+		return this.action("resume", { ...target, message });
 	}
 
 	interrupt(target: RunTarget): Promise<ActionOutcome> {

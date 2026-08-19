@@ -267,7 +267,9 @@ actual want: observe, type, return.
 - **List pane**: scan `async-subagent-runs/*/status.json`, filtered and capped
   the way the artifacts demand (443 dirs on this machine today, most of them the
   foreign extension's own test residue — an unfiltered scan is garbage). Sort by
-  `lastUpdate`; show state glyph, agent, elapsed, model.
+  recorded creation time, newest first, with a deterministic row-key tie-breaker;
+  never let output activity reorder the roster. Show state glyph, agent, elapsed,
+  model.
 - **Chat pane**: tail the child's **session file** incrementally, parse JSONL
   records into pi message objects, render through **pi's own components**
   (`AssistantMessageComponent`, `ToolExecutionComponent`, `UserMessageComponent`).
@@ -353,6 +355,14 @@ extensions in this stable manage foreign knowledge:
   mid-run instruction. Ack files are consumed (deleted) by the owning
   extension, so the hub watches them only on the file-fallback path where no
   owner is alive.
+- **Workflow shells are bookkeeping, not agents.** A workflow status and its
+  child status are separate records, linked by `parentWorkflowRunId` and the
+  workflow lane key. A resumed workflow shell can temporarily omit its step's
+  `sessionFile` while the child already has the original conversation file;
+  the hub links the pair before filtering and prefers the actual child record
+  for selection and controls. It borrows a session path only when that exact
+  workflow relation names one path, so two distinct lanes cannot merge by
+  label or timing.
 
 ## Phases
 

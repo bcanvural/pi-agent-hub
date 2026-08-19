@@ -78,6 +78,12 @@ export interface RunRow {
 	thinking?: string;
 	mode?: string;
 	cwd?: string;
+	/** Recorded `status.startedAt`, used for stable roster ordering. It is kept
+	 * separate from the step's `startedAt`: later steps must not reorder a run,
+	 * and a malformed/missing run timestamp must not borrow activity time. */
+	createdAt?: number;
+	/** Start time of this particular step, used for its elapsed label and
+	 * heartbeat fallback. */
 	startedAt?: number;
 	lastUpdate?: number;
 	lastActivityAt?: number;
@@ -96,6 +102,18 @@ export interface RunRow {
 	sessionFileExists: boolean;
 	/** Run-level output log name (relative to dir), when recorded. */
 	outputFile?: string;
+	/** The workflow shell that owns this child, when this is a workflow child.
+	 * A resumed child is written under a fresh workflow run, so this relation is
+	 * the only identity available while the shell's own step has no sessionFile. */
+	parentWorkflowRunId?: string;
+	/** Outer workflow relation key: parsed from `status.workflowKey` when
+	 * `parentWorkflowRunId` is present. */
+	parentWorkflowKey?: string;
+	/** Inner workflow relation key: parsed from `step.workflowKey` or
+	 * `status.workflowKey` for non-nested workflow runs. */
+	stepWorkflowKey?: string;
+	/** Unified/fallback workflow lane key. */
+	workflowKey?: string;
 	dir: string;
 }
 
@@ -208,6 +226,17 @@ function asNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** Timestamps must be strictly positive finite numbers. Negative or zero
+ * foreign values are hostile/malformed and normalized to undefined (neutral). */
+function asTimestamp(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Counters must be non-negative finite numbers. */
+function asCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
+}
+
 /** Enough of a reason to be worth a row, never enough to be a cost. Upstream's
  * run-level errors arrive with a stack trace attached, so the first line is
  * the whole signal and the rest is noise measured in kilobytes. */
@@ -296,21 +325,112 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
 			thinking: asString(step.thinking),
 			mode: asString(status.mode),
 			cwd: asString(status.cwd),
-			startedAt: asNumber(step.startedAt) ?? asNumber(status.startedAt),
-			lastUpdate: asNumber(status.lastUpdate),
-			lastActivityAt: asNumber(step.lastActivityAt),
+			createdAt: asTimestamp(status.startedAt),
+			startedAt: asTimestamp(step.startedAt) ?? asTimestamp(status.startedAt),
+			lastUpdate: asTimestamp(status.lastUpdate),
+			lastActivityAt: asTimestamp(step.lastActivityAt),
 			currentTool: asString(step.currentTool),
 			currentToolArgs: asString(step.currentToolArgs),
-			currentToolStartedAt: asNumber(step.currentToolStartedAt),
-			turnCount: asNumber(step.turnCount),
-			toolCount: asNumber(step.toolCount),
+			currentToolStartedAt: asTimestamp(step.currentToolStartedAt),
+			turnCount: asCount(step.turnCount),
+			toolCount: asCount(step.toolCount),
 			sessionFile,
 			sessionFileExists: sessionFile !== undefined && fs.existsSync(sessionFile),
 			outputFile: asString(status.outputFile),
+			parentWorkflowRunId: asString(status.parentWorkflowRunId),
+			parentWorkflowKey: asString(status.parentWorkflowRunId) !== undefined ? asString(status.workflowKey) : undefined,
+			stepWorkflowKey: asString(step.workflowKey) ?? (asString(status.parentWorkflowRunId) === undefined ? asString(status.workflowKey) : undefined),
+			workflowKey: asString(step.workflowKey) ?? asString(status.workflowKey),
 			dir,
 		});
 	}
 	return rows;
+}
+
+/** A workflow shell and its child are two status files, but one conversation.
+ * The child carries `parentWorkflowRunId`/`workflowKey`; the shell carries the
+ * same lane key on its step. Resumed workflow shells sometimes lose the
+ * step's sessionFile, so link the pair before the residue filter and borrow a
+ * session path only when the relation names exactly one path. A nested shell
+ * participates in both its parent relation and its own child relation. A
+ * conflicting component stays separate rather than guessing which conversation
+ * it is. */
+function linkWorkflowSessionFiles(rows: RunRow[]): RunRow[] {
+	const linked = [...rows];
+	const keysFor = (row: RunRow): string[] => {
+		// Workflow keys are model/user-chosen foreign strings. JSON keeps a colon
+		// or other separator in one tuple field instead of colliding two lanes.
+		const keys: string[] = [];
+		const outerKey = row.parentWorkflowKey ?? row.workflowKey;
+		if (row.parentWorkflowRunId !== undefined && outerKey !== undefined) {
+			keys.push(JSON.stringify([row.parentWorkflowRunId, outerKey]));
+		}
+		// A nested workflow is both a child and a shell. It must also expose its
+		// own relation, or its inner child cannot connect through it to the outer
+		// shell. The same key intentionally joins a shell's runId to its child's
+		// parentWorkflowRunId.
+		if (row.mode === "workflow" && row.stepWorkflowKey !== undefined) {
+			keys.push(JSON.stringify([row.runId, row.stepWorkflowKey]));
+		}
+		return keys;
+	};
+	// Build connected identity components in one bounded pass. Repeating a
+	// per-key copy could let a conflicting path leak through an intermediate
+	// nested shell; union first, then make the all-or-nothing path decision for
+	// the whole component.
+	const parent = rows.map((_, index) => index);
+	const find = (index: number): number => {
+		let root = index;
+		while (parent[root] !== root) root = parent[root]!;
+		while (parent[index] !== index) {
+			const next = parent[index]!;
+			parent[index] = root;
+			index = next;
+		}
+		return root;
+	};
+	const union = (left: number, right: number): void => {
+		const leftRoot = find(left);
+		const rightRoot = find(right);
+		if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot;
+	};
+	const firstByKey = new Map<string, number>();
+	for (let index = 0; index < linked.length; index++) {
+		for (const key of keysFor(linked[index]!)) {
+			const first = firstByKey.get(key);
+			if (first === undefined) firstByKey.set(key, index);
+			else union(first, index);
+		}
+	}
+	const components = new Map<number, number[]>();
+	for (let index = 0; index < linked.length; index++) {
+		const root = find(index);
+		const component = components.get(root);
+		if (component) component.push(index);
+		else components.set(root, [index]);
+	}
+	for (const component of components.values()) {
+		const files = new Set<string>();
+		for (const index of component) {
+			const sessionFile = linked[index]!.sessionFile;
+			if (sessionFile !== undefined) files.add(sessionFile);
+		}
+		if (files.size !== 1) continue;
+		const sessionFile = files.values().next().value!;
+		for (const index of component) {
+			const row = linked[index]!;
+			if (row.sessionFile !== undefined) continue;
+			linked[index] = { ...row, sessionFile, sessionFileExists: fs.existsSync(sessionFile) };
+		}
+	}
+	return linked;
+}
+
+export interface ScanResult {
+	/** Residue-filtered, deduplicated conversation rows sorted newest first. */
+	kept: RunRow[];
+	/** All pre-residue linked run graph rows, preserving workflow shells. */
+	linked: RunRow[];
 }
 
 /** Scan the runs root into list rows: parseable statuses only, most recent
@@ -318,12 +438,12 @@ function rowsFromStatus(dir: string, raw: unknown): RunRow[] {
  * exists (the runs worth reading) or it claims to be running and its heartbeat
  * is fresh (the runs worth watching). Test residue — hundreds of dirs on a
  * machine that has run the foreign extension's suite — fails both. */
-export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunRow[] {
+export function scanRuns(root: string, cache: ScanCache, now = Date.now()): ScanResult {
 	let names: string[];
 	try {
 		names = fs.readdirSync(root);
 	} catch {
-		return [];
+		return { kept: [], linked: [] };
 	}
 	const all: RunRow[] = [];
 	const seen = new Set<string>();
@@ -339,7 +459,12 @@ export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunR
 		seen.add(statusPath);
 		const cached = cache.get(statusPath);
 		if (cached && cached.mtimeMs === stat.mtimeMs) {
-			all.push(...cached.rows);
+			// `status.json` mtime does not move when the independently written
+			// session file appears or disappears. Refresh this foreign-file fact on
+			// every tick instead of freezing the initial cache verdict.
+			all.push(...cached.rows.map(row => row.sessionFile === undefined
+				? row
+				: { ...row, sessionFileExists: fs.existsSync(row.sessionFile) }));
 			continue;
 		}
 		let rows: RunRow[] = [];
@@ -354,21 +479,27 @@ export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunR
 	}
 	for (const key of cache.keys()) if (!seen.has(key)) cache.delete(key);
 
+	// A resumed workflow can publish its shell before the child status has a
+	// session path of its own. Link those records before judging residue, or the
+	// shell briefly appears as a second live agent and then disappears when it
+	// completes — exactly the flicker the roster must not show.
+	const linked = linkWorkflowSessionFiles(all);
 	// Judged by the same clock `isStale` uses. While this read the run's
 	// `lastUpdate` and staleness read the step's, a row this module's own rule
 	// called fresh could be dropped from the scan entirely — no label, glyph or
 	// counter downstream can rescue a row that never arrives.
-	const kept = all.filter(row => row.sessionFileExists || (row.state === "running" && now - lastBeat(row, now) < STALE_RUNNING_MS));
-	// Ranked by the same clock the filter and staleness use. Ranking by the
-	// RUN's `lastUpdate` while judging freshness by the step's put the one row
-	// this list exists to surface — a detached child still writing under a run
-	// record that stopped moving 40 minutes ago — behind every finished run,
-	// and the caller's MAX_ROWS cut it off the list entirely.
-	kept.sort((a, b) => lastBeat(b, now) - lastBeat(a, now));
+	const kept = linked.filter(row => row.sessionFileExists || (row.state === "running" && now - lastBeat(row, now) < STALE_RUNNING_MS));
+	// Stable roster order is creation order, newest first. Sorting by lastBeat
+	// made a row jump every time a different child emitted output, which turned
+	// a multi-agent list into a moving target and changed the meaning of j/k.
+	// Conversation merging in the hub applies the same creation-time rule to
+	// the whole group, so selecting a different record cannot restore activity
+	// ordering.
+	kept.sort(compareRunRows);
 	// Uncapped: the display bound belongs to the caller, after its scope
 	// filter — capping here let newer runs from other projects push a
 	// project's own runs out of the project view.
-	return kept;
+	return { kept, linked };
 }
 
 /** Unique by construction: two runs cannot share a directory, where two could
@@ -376,4 +507,16 @@ export function scanRuns(root: string, cache: ScanCache, now = Date.now()): RunR
  * since every lookup resolved to the first of the pair. */
 export function rowKey(row: RunRow): string {
 	return `${row.dir}:${row.stepIndex}`;
+}
+
+/** Newest recorded run creation first, with a deterministic identity tie-break.
+ * Activity is intentionally absent: output from one child must not move it past
+ * another child, and a later step must not move a sequential run. Missing or
+ * malformed `status.startedAt` is neutral rather than borrowing a step clock. */
+export function compareRunRows(left: RunRow, right: RunRow): number {
+	const byCreation = (right.createdAt ?? 0) - (left.createdAt ?? 0);
+	if (byCreation !== 0) return byCreation;
+	const leftKey = rowKey(left);
+	const rightKey = rowKey(right);
+	return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
 }

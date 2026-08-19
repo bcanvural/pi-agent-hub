@@ -30,6 +30,10 @@ const ANCHOR_BYTES = 64;
 const MAX_LINE_BYTES = 32 * 1024 * 1024;
 
 interface UsageShape {
+	input?: unknown;
+	output?: unknown;
+	cacheRead?: unknown;
+	cacheWrite?: unknown;
 	totalTokens?: unknown;
 	cost?: { total?: unknown };
 }
@@ -210,14 +214,21 @@ export class UsageMeter {
 						: undefined);
 				if (!usage) continue;
 				const cost = usage.cost?.total;
-				const tokens = usage.totalTokens;
+				const input = typeof usage.input === "number" && Number.isFinite(usage.input) && usage.input >= 0 && usage.input < 1e12 ? usage.input : 0;
+				const output = typeof usage.output === "number" && Number.isFinite(usage.output) && usage.output >= 0 && usage.output < 1e12 ? usage.output : 0;
+				const cacheRead = typeof usage.cacheRead === "number" && Number.isFinite(usage.cacheRead) && usage.cacheRead >= 0 && usage.cacheRead < 1e12 ? usage.cacheRead : 0;
+				const cacheWrite = typeof usage.cacheWrite === "number" && Number.isFinite(usage.cacheWrite) && usage.cacheWrite >= 0 && usage.cacheWrite < 1e12 ? usage.cacheWrite : 0;
+				const tokens = input + output + cacheRead + cacheWrite;
 				// Foreign numbers get the same suspicion as foreign strings —
 				// including absurd magnitude: 1e308 passes a finiteness check
 				// and one addition later every aggregate is Infinity.
-				if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0 && cost < 1e6) this.totals.cost += cost;
-				if (typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 && tokens < 1e12) this.totals.tokens += tokens;
-				this.totals.requests += 1;
-				changed = true;
+				const validCost = typeof cost === "number" && Number.isFinite(cost) && cost >= 0 && cost < 1e6 ? cost : 0;
+				if (validCost > 0) this.totals.cost += validCost;
+				if (tokens > 0) this.totals.tokens += tokens;
+				if (validCost > 0 || tokens > 0) {
+					this.totals.requests += 1;
+					changed = true;
+				}
 			} catch {
 				// Mid-write or malformed line; the transcript pane already
 				// tolerates these, the meter simply skips them.

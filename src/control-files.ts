@@ -125,7 +125,7 @@ export function writeSteerRequestFile(runDir: string, message: string, targetInd
 		ts,
 		message,
 		mode: "auto" as const,
-		...(targetIndex !== undefined && targetIndex > 0 ? { targetIndex } : {}),
+		...(targetIndex !== undefined ? { targetIndex } : {}),
 		source: "pi-agent-hub",
 	};
 	writeAtomicJson(path.join(controlDir(runDir), "steer-requests", `${String(ts).padStart(13, "0")}-${base64url(id)}.json`), request);
@@ -133,11 +133,12 @@ export function writeSteerRequestFile(runDir: string, message: string, targetInd
 }
 
 /** Fallback interrupt/stop: the portable request files the runner watches. */
-export function writeControlRequest(runDir: string, kind: "interrupt" | "stop", reason: string): void {
+export function writeControlRequest(runDir: string, kind: "interrupt" | "stop", reason: string, targetIndex?: number): void {
 	writeAtomicJson(path.join(controlDir(runDir), `${kind}.json`), {
 		type: kind,
 		ts: Date.now(),
 		source: "pi-agent-hub",
 		reason,
+		...(targetIndex !== undefined ? { targetIndex } : {}),
 	});
 }
